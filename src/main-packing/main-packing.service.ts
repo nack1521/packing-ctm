@@ -30,7 +30,7 @@ export interface PackageForProcessing {
 
 export interface CartPackingResult {
   success: boolean;
-  cart_id: string;
+  cart_object_id: string;
   cart_type: '1:1' | '1:m';
   basket_size_used: string;
   total_baskets: number;
@@ -40,13 +40,13 @@ export interface CartPackingResult {
   job_id: string;
   cart_details: {
     baskets: Array<{
-      basket_id: string;
+      basket_object_id: string;
       product_name?: string; // Add product name
-      product_id?: string; // Add product ID
+      product_object_id?: string; // Add product ID
       packages_count: number;
       total_weight: number;
       volume_utilization: number;
-      package_ids: string[];
+      package_object_ids: string[];
     }>;
   };
   message: string;
@@ -85,7 +85,7 @@ export class MainPackingService {
       if (unpackPackages.length === 0) {
         return {
           success: false,
-          cart_id: '',
+          cart_object_id: '',
           cart_type: '1:1',
           basket_size_used: '',
           total_baskets: 0,
@@ -129,7 +129,7 @@ export class MainPackingService {
       
       return {
         success: false,
-        cart_id: '',
+        cart_object_id: '',
         cart_type: '1:1', 
         basket_size_used: '',
         total_baskets: 0,
@@ -637,7 +637,7 @@ export class MainPackingService {
 
       return {
         success: true,
-        cart_id: cartDbId,
+        cart_object_id: cartDbId,
         cart_type: '1:m',
         basket_size_used: basketSize.package_name,
         total_baskets: basketDetails.length,
@@ -646,13 +646,13 @@ export class MainPackingService {
         packages_unpacked: unpackedPackageIds.length,
         job_id: jobId,
         cart_details: { baskets: basketDetails.map(basket => ({
-          basket_id: basket.basket_id,
-          product_name: basket.product_name, // Include product name 
-          product_id: basket.product_id, // Include product ID
+          basket_object_id: basket.basket_id,
+          product_name: basket.product_name, // Include product name
+          product_object_id: basket.product_id, // Include product ID
           packages_count: basket.packages_count,
           total_weight: basket.total_weight,
           volume_utilization: basket.volume_utilization,
-          package_ids: basket.package_ids
+          package_object_ids: basket.package_ids
         })) },
         message: `1:m cart packed with ManyCalService: ${packedPackageIds.length} packages across ${basketDetails.length} baskets (avg utilization: ${Math.round(basketDetails.reduce((sum, b) => sum + b.volume_utilization, 0) / basketDetails.length)}%)`
       };
@@ -924,7 +924,7 @@ export class MainPackingService {
 
       return {
         success: true,
-        cart_id: cartDbId,
+        cart_object_id: cartDbId,
         cart_type: '1:1',
         basket_size_used: basketSize.package_name,
         total_baskets: basketDetails.length,
@@ -933,13 +933,13 @@ export class MainPackingService {
         packages_unpacked: unpackedPackageIds.length,
         job_id: jobId,
         cart_details: { baskets: basketDetails.map(basket => ({
-          basket_id: basket.basket_id,
-          product_name: basket.product_name, // Include product name 
-          product_id: basket.product_id, // Include product ID
+          basket_object_id: basket.basket_id,
+          product_name: basket.product_name, // Include product name
+          product_object_id: basket.product_id, // Include product ID
           packages_count: basket.packages_count,
           total_weight: basket.total_weight,
           volume_utilization: basket.volume_utilization,
-          package_ids: basket.package_ids
+          package_object_ids: basket.package_ids
         })) },
         message: `1:1 cart packed with SingleCalService (product-grouped): ${packedPackageIds.length} packages across ${basketDetails.length} baskets (avg utilization: ${Math.round(basketDetails.reduce((sum, b) => sum + b.volume_utilization, 0) / basketDetails.length)}%)`
       };
@@ -1484,7 +1484,7 @@ export class MainPackingService {
 
     return {
       success: false,
-      cart_id: cartId,
+      cart_object_id: cartId,
       cart_type: cartType,
       basket_size_used: basketSizeName,
       total_baskets: 0,
