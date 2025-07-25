@@ -1,9 +1,13 @@
-import { Controller, Post, Get } from '@nestjs/common';
-import { MainPackingService, CartPackingResult } from './main-packing.service';
+import { Controller, Post, Get, HttpException, HttpStatus, Query } from '@nestjs/common';
+import { MainPackingService} from './main-packing.service';
+import { MainPackingServiceNew, CartPackingResultNew } from './main-packing.service.simplified';
 
 @Controller('main-packing')
 export class MainPackingController {
-  constructor(private readonly mainPackingService: MainPackingService) {}
+  constructor(
+    private readonly mainPackingService: MainPackingServiceNew,
+    private readonly mainPackingServiceOld: MainPackingService
+  ) {}
 
   /**
    * Main endpoint: Process packing workflow
@@ -13,10 +17,27 @@ export class MainPackingController {
    * @returns CartPackingResult with job details, cart info, and packing results
    */
   @Post('process-packages')
-  async processPackingWorkflow(): Promise<CartPackingResult> {
+  async processPackingWorkflow(): Promise<CartPackingResultNew> {
     return this.mainPackingService.processPackingWorkflow();
   }
 
+  
+
+  @Post('process-packages-mix')
+  async processMixPackingWorkflow(): Promise<CartPackingResultNew> {
+    return this.mainPackingService.processMixPackingWorkflow();
+  }
+
+  @Post('process')
+  async processPacking() {
+    const result = await this.mainPackingServiceOld.processPackingWorkflow();
+    if (!result.success) {
+      throw new HttpException(result.message, HttpStatus.BAD_REQUEST);
+    }
+    return result;
+  }
+
+  
   /**
    * Get all packed packages with their cart and basket information
    * Returns a flattened view of all packages showing which cart and basket they belong to
@@ -39,8 +60,26 @@ export class MainPackingController {
     }>;
     cart_id: string;
     basket_id: string;
-    created_at: Date;
+    createdAt: Date;
   }>> {
     return this.mainPackingService.getPackedPackagesWithLocation();
   }
+
+  /**
+   * Get packing statistics
+   * Returns current statistics about packages and jobs
+   * 
+   * @example GET /main-packing/stats
+   * @returns Object with package and job statistics
+   */
+  @Get('stats')
+  async getPackingStats(): Promise<{
+    total_unpack_packages: number;
+    packages_in_processing: number;
+    completed_jobs_today: number;
+    failed_jobs_today: number;
+  }> {
+    return this.mainPackingService.getPackingStats();
+  }
+
 }

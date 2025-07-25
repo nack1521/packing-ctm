@@ -9,6 +9,7 @@ import { Cart, CartSchema } from '../carts/schemas/cart.schema';
 import { Basket, BasketSchema } from '../baskets/schemas/basket.schema';
 import { SingleCalModule } from '../single_cal/single_cal.module';
 import { ManyCalModule } from '../many_cal/many_cal.module';
+import { MainPackingServiceNew } from './main-packing.service.simplified';
 
 @Module({
   imports: [
@@ -23,7 +24,7 @@ import { ManyCalModule } from '../many_cal/many_cal.module';
     ManyCalModule
   ],
   controllers: [MainPackingController],
-  providers: [MainPackingService],
+  providers: [MainPackingService, MainPackingServiceNew],
   exports: [MainPackingService]
 })
 export class MainPackingModule {}

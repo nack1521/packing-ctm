@@ -30,23 +30,10 @@ export enum JobPriority {
 export class Job {
   // Package information that this job is processing
   @Prop({ 
-    type: {
-      _id: { type: Types.ObjectId, ref: 'Package' },
-      product_list: [{ 
-        _id: { type: Types.ObjectId, ref: 'Product' },
-        product_name: { type: String }
-      }],
-      package_type: { type: String },
-      package_status: { type: String }
-    },
-    required: true
+    type: Array,
+    required: false
   })
-  package_info: {
-    _id: Types.ObjectId;
-    product_list: { _id: Types.ObjectId, product_name: string }[];
-    package_type: string;
-    package_status: string;
-  };
+  package_info: any[]; // Adjust 'any' to a more specific type if known
 
   // For SINGLE_CAL: one calendar entry
   @Prop({ 
