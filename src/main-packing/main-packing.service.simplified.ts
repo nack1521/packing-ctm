@@ -442,110 +442,150 @@ export class MainPackingServiceNew {
       return this.createFailedResult('No 1:1 packages found');
     }
 
-    const maxBasketVolume = basketSize.package_width * basketSize.package_length * basketSize.package_height;
-    const baskets: any[] = [];
-    let basketCounter = 1;
+    let baskets: any[] = [];
 
     if (useProductGroups) {
-      // Group by product type
       const productGroups = this.groupByProduct(oneToOnePackages);
+      const allBaskets: any[] = [];
+      let basketCounter = 0;
+
       for (const [productName, productPackages] of productGroups) {
-        let currentBasket: any = {
-          basket_id: `${cartId}_basket${basketCounter}`,
-          products: [],
-          usedVolume: 0
-        };
-        for (const pkg of productPackages) {
-          const product = pkg.product_list[0];
-          const dims = product.dimensions || { width: 10, length: 10, height: 10 };
-          const volume = dims.width * dims.length * dims.height;
-          const weight = product.product_weight || 100;
+        if (basketCounter >= PACKING_CONFIG.BASKETS_PER_CART) break;
 
-          // If adding this package exceeds basket volume, start new basket (if under limit)
-          if (currentBasket.usedVolume + volume > maxBasketVolume) {
-            currentBasket.volume_utilization = Math.round((currentBasket.usedVolume / maxBasketVolume) * 100);
-            baskets.push(currentBasket);
-            basketCounter++;
-            if (baskets.length >= 3) break; // Limit to 4 baskets
-            currentBasket = {
-              basket_id: `${cartId}_basket${basketCounter}`,
-              products: [],
-              usedVolume: 0
-            };
-          }
+        const singleCalPackages = productPackages.map(pkg => {
+          const dims = this.getPackageDimensions(pkg);
+          return {
+            _id: pkg._id,
+            package_id: pkg._id,
+            product_id: pkg.product_list[0]?._id || 'unknown',
+            weight: dims.weight,
+            w: dims.w,
+            h: dims.h,
+            d: dims.d,
+            dimensions: {
+              width: dims.w,
+              height: dims.h,
+              depth: dims.d
+            },
+            quantity: 1,
+            package_type: pkg.package_type,
+            package_status: pkg.package_status,
+            cost: 0
+          };
+        });
 
-          let basketProduct = currentBasket.products.find(p => p.product_id === product._id);
-          if (!basketProduct) {
-            basketProduct = {
-              product_name: product.product_name,
-              product_id: product._id,
-              packages_count: 0,
-              total_weight: 0,
-              volume: 0,
-              package_ids: []
-            };
-            currentBasket.products.push(basketProduct);
-          }
-          basketProduct.packages_count += 1;
-          basketProduct.total_weight += weight;
-          basketProduct.volume += volume;
-          basketProduct.package_ids.push(pkg._id);
+        const basketInputs = [{
+          basket_size_id: basketSize._id,
+          dimensions: {
+            width: basketSize.package_width,
+            height: basketSize.package_height,
+            depth: basketSize.package_length
+          },
+          max_weight: basketSize.package_weight,
+          cost: basketSize.package_cost || 0
+        }];
 
-          currentBasket.usedVolume += volume;
-        }
-        if (currentBasket.products.length > 0 && baskets.length < 4) {
-          currentBasket.volume_utilization = Math.round((currentBasket.usedVolume / maxBasketVolume) * 100);
-          baskets.push(currentBasket);
+        // Only one call per group
+        const result = await this.singleCalService.packSingleCal(singleCalPackages, basketInputs);
+
+        if (result.success && result.cart_details.baskets.length > 0) {
+          const productBaskets = result.cart_details.baskets.map((basket, idx) => ({
+            basket_id: `${cartId}_${productName}_${idx + 1}`,
+            products: [
+              {
+                product_name: productName,
+                product_id: productPackages[0].product_list[0]?._id || 'unknown',
+                package_type: productPackages[0].package_type,
+                packages_count: basket.packages_packed,
+                total_weight: basket.total_weight || 0,
+                volume: 0,
+                package_ids: basket.packed_package_ids
+              }
+            ],
+            usedVolume: 0,
+            volume_utilization: Math.round(basket.volume_utilization || 0)
+          }));
+
+          const remainingSlots = PACKING_CONFIG.BASKETS_PER_CART - basketCounter;
+          const basketsToAdd = productBaskets.slice(0, remainingSlots);
+          allBaskets.push(...basketsToAdd);
+          basketCounter += basketsToAdd.length;
         }
       }
+
+      baskets = allBaskets;
     } else {
-      // Mix all products in baskets (your current logic)
-      let currentBasket: any = {
-        basket_id: `${cartId}_basket${basketCounter}`,
-        products: [],
-        usedVolume: 0
-      };
-      for (const pkg of oneToOnePackages) {
-        const product = pkg.product_list[0];
-        const dims = product.dimensions || { width: 10, length: 10, height: 10 };
-        const volume = dims.width * dims.length * dims.height;
-        const weight = product.product_weight || 100;
+      
+      // Mix all products in baskets using singleCalService
+      const singleCalPackages = oneToOnePackages.map(pkg => {
+        const dims = this.getPackageDimensions(pkg);
+        return {
+          _id: pkg._id,
+          package_id: pkg._id,
+          product_id: pkg.product_list[0]?._id || 'unknown',
+          weight: dims.weight,
+          w: dims.w,
+          h: dims.h,
+          d: dims.d,
+          dimensions: {
+            width: dims.w,
+            height: dims.h,
+            depth: dims.d
+          },
+          quantity: 1,
+          package_type: pkg.package_type,
+          package_status: pkg.package_status,
+          cost: 0
+        };
+      });
 
-        // If adding this package exceeds basket volume, start new basket (if under limit)
-        if (currentBasket.usedVolume + volume > maxBasketVolume) {
-          currentBasket.volume_utilization = Math.round((currentBasket.usedVolume / maxBasketVolume) * 100);
-          baskets.push(currentBasket);
-          basketCounter++;
-          if (baskets.length >= 3) break; // Limit to 4 baskets
-          currentBasket = {
-            basket_id: `${cartId}_basket${basketCounter}`,
-            products: [],
-            usedVolume: 0
+      const basketInputs = [{
+        basket_size_id: basketSize._id,
+        dimensions: {
+          width: basketSize.package_width,
+          height: basketSize.package_height,
+          depth: basketSize.package_length
+        },
+        max_weight: basketSize.package_weight,
+        cost: basketSize.package_cost || 0
+      }];
+
+      const result = await this.singleCalService.packSingleCal(singleCalPackages, basketInputs);
+
+      if (result.success && result.cart_details.baskets.length > 0) {
+        // Limit baskets to 4
+        baskets = result.cart_details.baskets.slice(0, 4).map((basket, idx) => {
+          // Group package_ids by product_id and package_type
+          const packageGroups: { [key: string]: { product_name: string, product_id: string, package_type: string, package_ids: string[] } } = {};
+          for (const pkgId of basket.packed_package_ids) {
+            const pkg = oneToOnePackages.find(p => p._id === pkgId);
+            if (!pkg) continue;
+            const key = `${pkg.product_list[0]?._id || 'unknown'}|${pkg.package_type}`;
+            if (!packageGroups[key]) {
+              packageGroups[key] = {
+                product_name: pkg.product_list[0]?.product_name || 'Unknown',
+                product_id: pkg.product_list[0]?._id || 'unknown',
+                package_type: pkg.package_type,
+                package_ids: []
+              };
+            }
+            packageGroups[key].package_ids.push(pkgId);
+          }
+          const products = Object.values(packageGroups).map(group => ({
+            product_name: group.product_name,
+            product_id: group.product_id,
+            packages_count: group.package_ids.length,
+            package_ids: group.package_ids
+          }));
+          return {
+            basket_id: `${cartId}_basket${idx + 1}`,
+            products,
+            volume_utilization: Math.round(basket.volume_utilization || 0)
           };
-        }
-
-        let basketProduct = currentBasket.products.find(p => p.product_id === product._id);
-        if (!basketProduct) {
-          basketProduct = {
-            product_name: product.product_name,
-            product_id: product._id,
-            packages_count: 0,
-            total_weight: 0,
-            volume: 0,
-            package_ids: []
-          };
-          currentBasket.products.push(basketProduct);
-        }
-        basketProduct.packages_count += 1;
-        basketProduct.total_weight += weight;
-        basketProduct.volume += volume;
-        basketProduct.package_ids.push(pkg._id);
-
-        currentBasket.usedVolume += volume;
-      }
-      if (currentBasket.products.length > 0 && baskets.length < 4) {
-        currentBasket.volume_utilization = Math.round((currentBasket.usedVolume / maxBasketVolume) * 100);
-        baskets.push(currentBasket);
+        });
+      } else {
+        // If packing failed, return failed result
+        return this.createFailedResult('singleCalService could not pack any baskets');
       }
     }
 

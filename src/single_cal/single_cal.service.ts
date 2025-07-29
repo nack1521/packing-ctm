@@ -75,12 +75,10 @@ export class SingleCalService {
 
     // Try each basket size to find the best fit
     for (const basketOption of basketOptions) {
-      console.log(`Trying basket size: ${basketOption.basket_size_id}`);
       
       const cartResult = await this.tryPackCart(sortedPackages, basketOption);
       
       if (cartResult.cart_packed) {
-        console.log(`✓ Successfully packed 1 cart with basket size: ${basketOption.basket_size_id}`);
         
         // Update package statuses in database
         await this.updatePackageStatuses(
@@ -93,7 +91,6 @@ export class SingleCalService {
     }
 
     // If no basket size worked, mark all packages as unpacked
-    console.log('× No basket size could pack the packages successfully');
     await this.updatePackageStatuses([], packages.map(p => p._id));
 
     return {
@@ -133,14 +130,12 @@ export class SingleCalService {
     // Keep creating baskets until all packages are packed or no more can fit
     while (remainingPackages.length > 0) {
       const basketId = `${basketOption.basket_size_id}_${basketIndex}`;
-      console.log(`  Trying basket ${basketId} with ${remainingPackages.length} remaining packages`);
 
       // Try to pack as many packages as possible in this basket
       const packingResult = await this.calculateService.calculatePacking(remainingPackages, basketOption);
 
       if (packingResult.fitted_items === 0) {
         // No packages could fit in this basket - stop trying
-        console.log(`  × No packages could fit in basket ${basketId}`);
         break;
       }
 
@@ -174,12 +169,11 @@ export class SingleCalService {
         packed_package_ids: packedInThisBasket
       });
 
-      console.log(`  ✓ Basket ${basketId}: packed ${packedInThisBasket.length} packages`);
       basketIndex++;
 
       // Stop after reasonable number of baskets to prevent infinite loop
-      if (basketIndex > 10) {
-        console.log(`  ! Stopped after 10 baskets to prevent infinite loop`);
+      if (basketIndex > 4) {
+        console.log(`  ! Stopped after 4 baskets to prevent infinite loop`);
         break;
       }
     }

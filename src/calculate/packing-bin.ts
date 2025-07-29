@@ -80,13 +80,11 @@ export class PackingBin {
     item.position = pivot;
     
     const rotations = item.getAvailableRotations();
-    console.log(`🔄 [PackingBin] Trying to place ${item.partno} at position [${pivot[0]}, ${pivot[1]}, ${pivot[2]}] with ${rotations.length} rotations in bin ${this.width}×${this.height}×${this.depth}...`);
     
     for (let i = 0; i < rotations.length; i++) {
       item.rotation_type = rotations[i];
       const dimension = item.getDimension();
       
-      console.log(`  [PackingBin] Rotation ${i + 1}/${rotations.length}: ${dimension[0]}×${dimension[1]}×${dimension[2]} (type: ${rotations[i]})`);
       
       // Check if item fits in bin
       if (
@@ -94,24 +92,20 @@ export class PackingBin {
         this.height < pivot[1] + dimension[1] ||
         this.depth < pivot[2] + dimension[2]
       ) {
-        console.log(`    ❌ Exceeds bin bounds: needs ${pivot[0] + dimension[0]}×${pivot[1] + dimension[1]}×${pivot[2] + dimension[2]}, bin is ${this.width}×${this.height}×${this.depth}`);
         continue;
       }
 
       fit = true;
-      console.log(`    ✅ Fits in bin bounds`);
-
+      
       // Check intersection with other items
       for (const current_item_in_bin of this.items) {
         if (intersect(current_item_in_bin, item)) {
-          console.log(`    ❌ Intersects with existing item ${current_item_in_bin.partno}`);
           fit = false;
           break;
         }
       }
 
       if (fit) {
-        console.log(`    ✅ No intersections detected`);
         // Check weight constraint
         if (this.getTotalWeight() + item.weight > this.max_weight) {
           console.log(`    ❌ Exceeds weight limit: ${this.getTotalWeight() + item.weight} > ${this.max_weight}`);
@@ -187,7 +181,6 @@ export class PackingBin {
       return fit;
     }
 
-    console.log(`❌ [PackingBin] Failed to place ${item.partno} with any of the ${rotations.length} rotations`);
     item.position = valid_item_position;
     return fit;
   }
