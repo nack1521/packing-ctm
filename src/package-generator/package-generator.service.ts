@@ -33,7 +33,7 @@ export class PackageGeneratorService {
    */
   async generateRandomPackages(dto?: GeneratePackagesDto): Promise<PackageGenerationResult> {
     const oneToOneCount = dto?.oneToOneCount || 80;
-    const oneToManyCount = dto?.oneToManyCount || 0;
+    const oneToManyCount = dto?.oneToManyCount || 80;
 
     try {
       console.log(`🎲 Generating ${oneToOneCount} 1:1 packages and ${oneToManyCount} 1:m packages...`);
@@ -75,8 +75,8 @@ export class PackageGeneratorService {
       // Step 3: Generate 1:m packages (ONE_TO_MANY) - Multiple products per package
       const oneToManyPackages: Array<any> = [];
       for (let i = 0; i < oneToManyCount; i++) {
-        // Generate 2-5 random products for each ONE_TO_MANY package
-        const productCount = Math.floor(Math.random() * 4) + 2; // 2 to 5 products
+        // Generate 5-20 random products for each ONE_TO_MANY package
+        const productCount = Math.floor(Math.random() * 16) + 5; // 5 to 20 products
         const selectedProducts: Array<{ _id: any; product_name: string }> = [];
         
         for (let j = 0; j < productCount; j++) {
