@@ -1,4 +1,4 @@
-import { Controller, Post, Get, HttpException, HttpStatus, Query } from '@nestjs/common';
+import { Controller, Post, Get, HttpException, HttpStatus, Query, Body } from '@nestjs/common';
 import { MainPackingService} from './main-packing.service';
 import { MainPackingServiceNew, CartPackingResultNew } from './main-packing.service.simplified';
 
@@ -82,4 +82,9 @@ export class MainPackingController {
     return this.mainPackingService.getPackingStats();
   }
 
+
+  @Post('find')
+  async findSmallestBasket(@Body() body: any): Promise<any> {
+    return this.mainPackingService.findSmallestBasket(body);
+  }
 }

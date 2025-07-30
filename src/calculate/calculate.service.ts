@@ -69,7 +69,7 @@ export class CalculateService {
       console.log(`📦 BASKET DIMENSIONS: ${basketDimensions[0]}×${basketDimensions[1]}×${basketDimensions[2]} (max weight: ${basket.max_weight})`);
       console.log(`📦 PACKAGES TO PACK:`);
       packingItems.slice(0, 5).forEach((item, index) => {
-        console.log(`  ${index + 1}. ${item.partno}: ${item.width}×${item.height}×${item.depth} (weight: ${item.weight}g, updown: ${item.updown})`);
+        console.log(`  ${index + 1}. ${item.partno}: ${item.width}×${item.depth}×${item.height} (weight: ${item.weight}g, updown: ${item.updown})`);
       });
       if (packingItems.length > 5) {
         console.log(`  ... and ${packingItems.length - 5} more packages`);

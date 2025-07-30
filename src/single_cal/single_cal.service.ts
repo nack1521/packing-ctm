@@ -204,22 +204,26 @@ export class SingleCalService {
    */
   private async updatePackageStatuses(packedIds: string[], unpackedIds: string[]): Promise<void> {
     try {
+      // Only keep valid ObjectIds
+      const validPackedIds = packedIds.filter(id => /^[a-f\d]{24}$/i.test(id));
+      const validUnpackedIds = unpackedIds.filter(id => /^[a-f\d]{24}$/i.test(id));
+
       // Update packed packages status to "packed"
-      if (packedIds.length > 0) {
+      if (validPackedIds.length > 0) {
         await this.packageModel.updateMany(
-          { _id: { $in: packedIds } },
+          { _id: { $in: validPackedIds } },
           { package_status: 'Packed' }
         );
-        console.log(`✓ Updated ${packedIds.length} packages to status "Packed"`);
+        console.log(`✓ Updated ${validPackedIds.length} packages to status "Packed"`);
       }
 
       // Update unpacked packages status to "unpack"
-      if (unpackedIds.length > 0) {
+      if (validUnpackedIds.length > 0) {
         await this.packageModel.updateMany(
-          { _id: { $in: unpackedIds } },
+          { _id: { $in: validUnpackedIds } },
           { package_status: 'Unpack' }
         );
-        console.log(`✓ Updated ${unpackedIds.length} packages to status "Unpack"`);
+        console.log(`✓ Updated ${validUnpackedIds.length} packages to status "Unpack"`);
       }
     } catch (error) {
       console.error('Error updating package statuses:', error);
