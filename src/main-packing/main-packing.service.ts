@@ -7,11 +7,36 @@ import { BasketSize } from '../basket_sizes/schemas/basket_size.schema';
 import { Cart, CartStatus } from '../carts/schemas/cart.schema';
 import { Basket, BasketType, BasketStatus } from '../baskets/schemas/basket.schema';
 import { SingleCalService } from '../single_cal/single_cal.service';
-import { ManyCalService } from '../many_cal/many_cal.service';
-import { 
-  PACKING_CONFIG, 
-  DEFAULT_DIMENSIONS 
-} from './constants';
+import { PACKING_CONFIG } from './constants';
+
+interface ProductInfo {
+  _id: string;
+  product_name: string;
+  product_weight?: number;
+  dimensions?: { width: number; length: number; height: number; };
+}
+
+interface PackageForProcessing {
+  _id: string;
+  product_list: ProductInfo[];
+  package_type: PackageType;
+  package_status: PackageStatus;
+  createdAt: Date;
+}
+
+export interface CartPackingResultNew {
+  success: boolean;
+  cart_object_id: string;
+  cart_type: '1:1' | '1:m';
+  basket_size_used: string;
+  total_baskets: number;
+  packages_processed: number;
+  packages_packed: number;
+  packages_unpacked: number;
+  job_object_id: string;
+  cart_details: { baskets: any[] };
+  message: string;
+}
 
 @Injectable()
 export class MainPackingService {
@@ -21,141 +46,624 @@ export class MainPackingService {
     @InjectModel(BasketSize.name) private basketSizeModel: Model<BasketSize>,
     @InjectModel(Cart.name) private cartModel: Model<Cart>,
     @InjectModel(Basket.name) private basketModel: Model<Basket>,
-    private singleCalService: SingleCalService,
-    private manyCalService: ManyCalService,
+    private singleCalService: SingleCalService
   ) {}
 
-  async processPackingWorkflow() {
-    const unpackPackages = await this.getUnpackPackages();
-    if (!unpackPackages.length) return this.createResult(false, 'No unpack packages found');
-
+  async processMixPackingWorkflow(): Promise<CartPackingResultNew> {
     try {
-      const jobId = await this.createJob(unpackPackages);
-      const cartType = this.getCartType(unpackPackages[0]);
-      const basketSizes = await this.getSortedBasketSizes();
-      const result = await this.packWithAlgorithm(unpackPackages, basketSizes, cartType, jobId);
-      await this.finalizeJob(jobId, result);
+      const packages = await this.getUnpackPackages();
+      if (!packages.length) {
+        return this.createFailedResult('No unpack packages found');
+      }
+
+      const job = await this.createJob(packages.length);
+      await this.updatePackageStatus(packages.map(p => p._id), PackageStatus.IN_PROCESS);
+
+      const cartType = this.getCartType(packages[0]);
+      const basketSizes = await this.getBasketSizes();
+
+      if (!basketSizes.length) {
+        await this.completeJob(job._id.toString(), false);
+        return this.createFailedResult('No basket sizes available');
+      }
+
+      const result = await this.packMixCart(packages, basketSizes, cartType, job._id.toString());
+      await this.completeJob(job._id.toString(), result.success);
+
       return result;
-    } catch (e) {
-      console.error('Packing error:', e);
-      return this.createResult(false, e.message);
+    } catch (error) {
+      console.error('❌ Packing workflow error:', error);
+      return this.createFailedResult(`Error: ${error.message}`);
     }
   }
 
-  private async getUnpackPackages() {
-    return await this.packageModel
+  // Get packages ready for packing
+  private async getUnpackPackages(): Promise<PackageForProcessing[]> {
+    const packages = await this.packageModel
       .find({ package_status: PackageStatus.UNPACK })
-      .sort({ createdAt: 1 })
-      .select('_id product_list package_type package_status createdAt updatedAt')
       .populate('product_list._id', 'product_name product_weight dimensions')
+      .sort({ createdAt: 1 })
+      .select('product_list package_type package_status createdAt')
       .lean();
+
+    // Map to ensure createdAt is present and types match
+    return packages.map((pkg: any) => ({
+      _id: pkg._id.toString(),
+      product_list: (pkg.product_list || []).map((p: any) => ({
+        _id: p._id?._id?.toString?.() || p._id?.toString?.() || p._id || '',
+        product_name: p._id?.product_name || p.product_name || '',
+        product_weight: p._id?.product_weight ?? p.product_weight,
+        dimensions: p._id?.dimensions ?? p.dimensions,
+      })),
+      package_type: pkg.package_type,
+      package_status: pkg.package_status,
+      createdAt: pkg.createdAt ? new Date(pkg.createdAt) : new Date(),
+    }));
   }
 
-  private async createJob(packages) {
-    const job = new this.jobModel({
-      package_info: {
-        product_list: packages[0].product_list.map(p => ({
-          _id: p._id,
-          product_name: p.product_name || 'Unknown',
-        })),
-        package_type: packages[0].package_type,
-        package_status: PackageStatus.IN_PROCESS
-      },
-      job_type: packages.some(p => p.package_type === PackageType.ONE_TO_MANY) ? JobType.MANY_CAL : JobType.SINGLE_CAL,
+  // Create processing job
+  private async createJob(packageCount: number) {
+    return this.jobModel.create({
+      job_type: JobType.SINGLE_CAL,
       job_status: JobStatus.IN_PROGRESS,
       job_priority: JobPriority.MEDIUM,
-      job_description: `Processing ${packages.length} packages`,
-      scheduled_start_date: new Date(),
-      total_calendar_entries: packages.length,
-      total_duration_minutes: packages.length * PACKING_CONFIG.ESTIMATED_MINUTES_PER_PACKAGE
+      total_packages: packageCount,
+      processed_packages: 0,
+      successful_packages: 0,
+      failed_packages: 0,
     });
-
-    const saved = await job.save();
-    await this.packageModel.updateMany(
-      { _id: { $in: packages.map(p => p._id) } },
-      { package_status: PackageStatus.IN_PROCESS }
-    );
-    return saved._id.toString();
   }
 
-  private async finalizeJob(jobId: string, result: any) {
-    const status = result.success ? JobStatus.COMPLETED : JobStatus.CANCELLED;
-    await this.jobModel.updateOne(
-      { _id: new Types.ObjectId(jobId) },
-      { job_status: status, actual_end_date: new Date(), updatedAt: new Date() }
-    );
-  }
-
-  private async getSortedBasketSizes() {
-    const sizes = await this.basketSizeModel.find({ package_use: true }).lean();
-    return sizes.sort((a, b) => a.package_width * a.package_length * a.package_height - b.package_width * b.package_length * b.package_height);
-  }
-
-  private getCartType(pkg): '1:1' | '1:m' {
+  // Determine cart type from first package
+  private getCartType(pkg: PackageForProcessing): '1:1' | '1:m' {
     return pkg.package_type === PackageType.ONE_TO_MANY ? '1:m' : '1:1';
   }
 
-  private async packWithAlgorithm(packages, basketSizes, cartType, jobId) {
-    const packFn = cartType === '1:m' ? this.manyCalService.packManyCal : this.singleCalService.packSingleCal;
-    const firstPackage = packages[0];
-    const selectedBasket = basketSizes.find(b => {
-      // simple size filter — replace with rotation logic if needed
-      return b.package_width >= 10 && b.package_height >= 10 && b.package_length >= 10;
-    });
+  // Get available basket sizes
+  private async getBasketSizes() {
+    return this.basketSizeModel
+      .find({ package_use: true })
+      .sort({ package_width: 1, package_length: 1, package_height: 1 })
+      .lean();
+  }
 
-    if (!selectedBasket) return this.createResult(false, 'No basket fits the first package');
+  private async packMixCart(
+    packages: PackageForProcessing[],
+    basketSizes: any[],
+    cartType: '1:1' | '1:m',
+    jobId: string
+  ): Promise<CartPackingResultNew> {
+    const cartId = `cart_${cartType}_${Date.now()}`;
 
-    const basketInput = [{
-      basket_size_id: selectedBasket._id,
-      dimensions: {
-        width: selectedBasket.package_width,
-        height: selectedBasket.package_height,
-        depth: selectedBasket.package_length
-      },
-      max_weight: selectedBasket.package_weight
-    }];
+    // Test with smallest basket first
+    for (const basketSize of basketSizes) {
+      const canFit = await this.testFirstPackageFit(packages[0], basketSize);
+      if (canFit) {
+        return cartType === '1:m'
+          ? this.process1mCart(packages, basketSizes, cartId, jobId)
+          : this.process1nMixCart(packages, basketSize, cartId, jobId);
+      }
+    }
 
-    const calInput = cartType === '1:m' ? {
-      _id: firstPackage._id,
-      product_id: firstPackage.product_list[0]?._id || 'unknown',
-      weight: firstPackage.product_list[0]?.product_weight || 100,
-      dimensions: firstPackage.product_list[0]?.dimensions || DEFAULT_DIMENSIONS.PACKAGE,
-      quantity: packages.length,
-      package_type: firstPackage.package_type,
-      package_status: firstPackage.package_status,
-      cost: 0
-    } : packages.map(p => ({
-      _id: p._id,
-      package_id: p._id,
-      product_id: p.product_list[0]?._id,
-      weight: p.product_list[0]?.product_weight || 100,
-      dimensions: p.product_list[0]?.dimensions || DEFAULT_DIMENSIONS.PACKAGE,
-      quantity: 1,
-      package_type: p.package_type,
-      package_status: p.package_status,
-      cost: 0
-    }));
+    return this.createFailedResult('No suitable basket size found');
+  }
 
-    const result = await packFn.call(cartType === '1:m' ? this.manyCalService : this.singleCalService, calInput, basketInput);
+  // Test if package fits in basket
+  private async testFirstPackageFit(pkg: PackageForProcessing, basketSize: any): Promise<boolean> {
+    const pkgDims = this.getPackageDimensions(pkg);
+    const basketDims = {
+      w: basketSize.package_width,
+      h: basketSize.package_height,
+      d: basketSize.package_length
+    };
+
+    // Check weight
+    if (pkgDims.weight > basketSize.package_weight * 1000) return false;
+
+    // Check all 6 rotations
+    const rotations = [
+      [pkgDims.w, pkgDims.h, pkgDims.d],
+      [pkgDims.h, pkgDims.w, pkgDims.d],
+      [pkgDims.d, pkgDims.h, pkgDims.w],
+      [pkgDims.w, pkgDims.d, pkgDims.h],
+      [pkgDims.h, pkgDims.d, pkgDims.w],
+      [pkgDims.d, pkgDims.w, pkgDims.h]
+    ];
+
+    return rotations.some(([w, h, d]) =>
+      w <= basketDims.w && h <= basketDims.h && d <= basketDims.d
+    );
+  }
+
+  // Process 1:m cart (one package per basket)
+  private async process1mCart(
+    packages: PackageForProcessing[],
+    basketSizes: any,
+    cartId: string,
+    jobId: string
+  ): Promise<CartPackingResultNew> {
+    // Only keep ONE_TO_MANY packages
+    const oneToManyPackages = packages.filter(p => p.package_type === PackageType.ONE_TO_MANY);
+
+    if (!oneToManyPackages.length) {
+      return this.createFailedResult('No 1:m packages found');
+    }
+
+    // Find the smallest basket that can fit the first package using singleCalService
+    let referenceBasket: any = null;
+    for (const basketSize of basketSizes) {
+      const singleCalPackages = oneToManyPackages.length
+        ? oneToManyPackages[0].product_list.map((product, idx) => ({
+            _id: `${oneToManyPackages[0]._id}_${idx}`,
+            package_id: oneToManyPackages[0]._id,
+            product_id: product._id,
+            weight: product.product_weight || 100,
+            w: product.dimensions?.width || 10,
+            h: product.dimensions?.height || 10,
+            d: product.dimensions?.length || 10,
+            dimensions: {
+              width: product.dimensions?.width || 10,
+              height: product.dimensions?.height || 10,
+              depth: product.dimensions?.length || 10,
+            },
+            quantity: 1,
+            package_type: oneToManyPackages[0].package_type,
+            package_status: oneToManyPackages[0].package_status,
+            cost: 0,
+          }))
+        : [];
+
+      const basketInputs = [{
+        basket_size_id: basketSize._id,
+        dimensions: {
+          width: basketSize.package_width,
+          height: basketSize.package_height,
+          depth: basketSize.package_length
+        },
+        max_weight: basketSize.package_weight,
+        cost: basketSize.package_cost || 0
+      }];
+
+      const result = await this.singleCalService.packSingleCal(singleCalPackages, basketInputs);
+
+      if (result.success && result.cart_details?.baskets?.length === 1) {
+        referenceBasket = basketSize;
+        break;
+      }
+    }
+
+    if (!referenceBasket) {
+      return this.createFailedResult('No suitable basket found for the first package');
+    }
+
+    // Now try to pack each ONE_TO_MANY package into a basket of referenceBasket size
+    const baskets: any[] = [];
+    let basketCounter = 1;
+    const packedIds: string[] = [];
+
+    for (const pkg of oneToManyPackages) {
+      if (baskets.length >= 4) break;
+
+      // Prepare singleCal input for this package
+      const singleCalPackages = pkg.product_list.map((product, idx) => ({
+        _id: `${pkg._id}_${idx}`,
+        package_id: pkg._id,
+        product_id: product._id,
+        weight: product.product_weight || 100,
+        w: product.dimensions?.width || 10,
+        h: product.dimensions?.height || 10,
+        d: product.dimensions?.length || 10,
+        dimensions: {
+          width: product.dimensions?.width || 10,
+          height: product.dimensions?.height || 10,
+          depth: product.dimensions?.length || 10,
+        },
+        quantity: 1,
+        package_type: pkg.package_type,
+        package_status: pkg.package_status,
+        cost: 0,
+      }));
+
+      const basketInputs = [{
+        basket_size_id: referenceBasket._id.toString(),
+        dimensions: {
+          width: referenceBasket.package_width,
+          height: referenceBasket.package_height,
+          depth: referenceBasket.package_length
+        },
+        max_weight: referenceBasket.package_weight,
+        cost: referenceBasket.package_cost || 0
+      }];
+
+      const result = await this.singleCalService.packSingleCal(singleCalPackages, basketInputs);
+
+      // Only pack if all products fit in one basket
+      if (result.success && result.cart_details?.baskets?.length === 1) {
+        baskets.push({
+          basket_id: `${cartId}_basket${basketCounter++}`,
+          products: pkg.product_list.map(product => ({
+            product_name: product.product_name,
+            product_object_id: product._id,
+            product_count: 1,
+            package_ids: [pkg._id]
+          })),
+          volume_utilization: Math.round(result.cart_details.baskets[0].volume_utilization || 0)
+        });
+        packedIds.push(pkg._id);
+      }
+      // If not fit, skip (throw out)
+    }
+
+    // Update package status
+    await this.updatePackageStatus(packedIds, PackageStatus.PACKED);
+    await this.updatePackageStatus(
+      packages.map(p => p._id).filter(id => !packedIds.includes(id)),
+      PackageStatus.UNPACK
+    );
+
+    const { cartDbId } = await this.createCartAndBaskets(
+      cartId, '1:m', referenceBasket,
+      oneToManyPackages.filter(p => packedIds.includes(p._id)),
+      baskets
+    );
 
     return {
-      success: result.success,
-      cart_object_id: `cart_${Date.now()}`,
-      cart_type: cartType,
-      basket_size_used: selectedBasket.package_name,
-      total_baskets: result.basket_details?.length || 0,
-      packages_processed: packages.length,
-      packages_packed: result.packed_quantity || result.packed_packages || 0,
-      packages_unpacked: packages.length - (result.packed_quantity || result.packed_packages || 0),
-      job_id: jobId,
-      cart_details: { baskets: result.basket_details || [] },
-      message: result.success ? 'Packing successful' : 'Packing failed'
+      success: true,
+      cart_object_id: cartDbId,
+      cart_type: '1:m',
+      basket_size_used: referenceBasket.package_name,
+      total_baskets: baskets.length,
+      packages_processed: oneToManyPackages.length,
+      packages_packed: packedIds.length,
+      packages_unpacked: oneToManyPackages.length - packedIds.length,
+      job_object_id: jobId,
+      cart_details: { baskets },
+      message: `1:m cart: ${packedIds.length} packages in ${baskets.length} baskets (max 4)`
     };
   }
 
-  private createResult(success: boolean, message: string) {
+  private async process1nMixCart(
+    packages: PackageForProcessing[],
+    basketSize: any,
+    cartId: string,
+    jobId: string,
+    useProductGroups: boolean = false // default: mix products
+  ): Promise<CartPackingResultNew> {
+    const oneToOnePackages = packages
+      .filter(p => p.package_type === PackageType.ONE_TO_ONE)
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+
+    if (!oneToOnePackages.length) {
+      return this.createFailedResult('No 1:1 packages found');
+    }
+
+    let baskets: any[] = [];
+
+    if (useProductGroups) {
+      const productGroups = this.groupByProduct(oneToOnePackages);
+      const allBaskets: any[] = [];
+      let basketCounter = 0;
+
+      for (const [productName, productPackages] of productGroups) {
+        if (basketCounter >= PACKING_CONFIG.BASKETS_PER_CART) break;
+
+        const singleCalPackages = productPackages.map(pkg => {
+          const dims = this.getPackageDimensions(pkg);
+          return {
+            _id: pkg._id,
+            package_id: pkg._id,
+            product_id: pkg.product_list[0]?._id || 'unknown',
+            weight: dims.weight,
+            w: dims.w,
+            h: dims.h,
+            d: dims.d,
+            dimensions: {
+              width: dims.w,
+              height: dims.h,
+              depth: dims.d
+            },
+            quantity: 1,
+            package_type: pkg.package_type,
+            package_status: pkg.package_status,
+            cost: 0
+          };
+        });
+
+        const basketInputs = [{
+          basket_size_id: basketSize._id,
+          dimensions: {
+            width: basketSize.package_width,
+            height: basketSize.package_height,
+            depth: basketSize.package_length
+          },
+          max_weight: basketSize.package_weight,
+          cost: basketSize.package_cost || 0
+        }];
+
+        // Only one call per group
+        const result = await this.singleCalService.packSingleCal(singleCalPackages, basketInputs);
+
+        if (result.success && result.cart_details.baskets.length > 0) {
+          const productBaskets = result.cart_details.baskets.map((basket, idx) => ({
+            basket_id: `${cartId}_${productName}_${idx + 1}`,
+            products: [
+              {
+                product_name: productName,
+                product_id: productPackages[0].product_list[0]?._id || 'unknown',
+                package_type: productPackages[0].package_type,
+                packages_count: basket.packages_packed,
+                total_weight: basket.total_weight || 0,
+                volume: 0,
+                package_ids: basket.packed_package_ids
+              }
+            ],
+            usedVolume: 0,
+            volume_utilization: Math.round(basket.volume_utilization || 0)
+          }));
+
+          const remainingSlots = PACKING_CONFIG.BASKETS_PER_CART - basketCounter;
+          const basketsToAdd = productBaskets.slice(0, remainingSlots);
+          allBaskets.push(...basketsToAdd);
+          basketCounter += basketsToAdd.length;
+        }
+      }
+
+      baskets = allBaskets;
+    } else {
+      
+      // Mix all products in baskets using singleCalService
+      const singleCalPackages = oneToOnePackages.map(pkg => {
+        const dims = this.getPackageDimensions(pkg);
+        return {
+          _id: pkg._id,
+          package_id: pkg._id,
+          product_id: pkg.product_list[0]?._id || 'unknown',
+          weight: dims.weight,
+          w: dims.w,
+          h: dims.h,
+          d: dims.d,
+          dimensions: {
+            width: dims.w,
+            height: dims.h,
+            depth: dims.d
+          },
+          quantity: 1,
+          package_type: pkg.package_type,
+          package_status: pkg.package_status,
+          cost: 0
+        };
+      });
+
+      const basketInputs = [{
+        basket_size_id: basketSize._id,
+        dimensions: {
+          width: basketSize.package_width,
+          height: basketSize.package_height,
+          depth: basketSize.package_length
+        },
+        max_weight: basketSize.package_weight,
+        cost: basketSize.package_cost || 0
+      }];
+
+      const result = await this.singleCalService.packSingleCal(singleCalPackages, basketInputs);
+
+      if (result.success && result.cart_details.baskets.length > 0) {
+        // Limit baskets to 4
+        baskets = result.cart_details.baskets.slice(0, 4).map((basket, idx) => {
+          // Group package_ids by product_id and package_type
+          const packageGroups: { [key: string]: { product_name: string, product_id: string, package_type: string, package_ids: string[] } } = {};
+          for (const pkgId of basket.packed_package_ids) {
+            const pkg = oneToOnePackages.find(p => p._id === pkgId);
+            if (!pkg) continue;
+            const key = `${pkg.product_list[0]?._id || 'unknown'}|${pkg.package_type}`;
+            if (!packageGroups[key]) {
+              packageGroups[key] = {
+                product_name: pkg.product_list[0]?.product_name || 'Unknown',
+                product_id: pkg.product_list[0]?._id || 'unknown',
+                package_type: pkg.package_type,
+                package_ids: []
+              };
+            }
+            packageGroups[key].package_ids.push(pkgId);
+          }
+          const products = Object.values(packageGroups).map(group => ({
+            product_name: group.product_name,
+            product_object_id: group.product_id,
+            product_count: group.package_ids.length,
+            package_object_ids: group.package_ids
+          }));
+          return {
+            basket_id: `${cartId}_basket${idx + 1}`,
+            products,
+            volume_utilization: Math.round(basket.volume_utilization || 0)
+          };
+        });
+      } else {
+        // If packing failed, return failed result
+        return this.createFailedResult('singleCalService could not pack any baskets');
+      }
+    }
+
+    // Collect all packed package IDs
+    const packedIds = baskets.flatMap(basket =>
+      basket.products.flatMap(prod => prod.package_ids)
+    );
+
+    await this.updatePackageStatus(packedIds, PackageStatus.PACKED);
+    await this.updatePackageStatus(
+      packages.map(p => p._id).filter(id => !packedIds.includes(id)),
+      PackageStatus.UNPACK
+    );
+
+    const { cartDbId } = await this.createCartAndBaskets(
+      cartId, '1:1', basketSize,
+      oneToOnePackages.filter(p => packedIds.includes(p._id)),
+      baskets
+    );
+
     return {
-      success,
+      success: true,
+      cart_object_id: cartDbId,
+      cart_type: '1:1',
+      basket_size_used: basketSize.package_name,
+      total_baskets: baskets.length,
+      packages_processed: packages.length,
+      packages_packed: packedIds.length,
+      packages_unpacked: packages.length - packedIds.length,
+      job_object_id: jobId,
+      cart_details: { baskets },
+      message: `1:1 mixed cart: ${packedIds.length} packages in ${baskets.length} baskets`
+    };
+  }
+
+  // Helper: Group packages by product
+  private groupByProduct(packages: PackageForProcessing[]): Map<string, PackageForProcessing[]> {
+    const groups = new Map();
+    packages.forEach(pkg => {
+      const productName = pkg.product_list[0]?.product_name || 'Unknown';
+      if (!groups.has(productName)) groups.set(productName, []);
+      groups.get(productName).push(pkg);
+    });
+    return groups;
+  }
+
+  // Helper: Calculate package dimensions (simplified)
+  private getPackageDimensions(pkg: PackageForProcessing) {
+    const weight = pkg.product_list.reduce((sum, p) => sum + (p.product_weight || 100), 0);
+
+    if (!pkg.product_list.length) {
+        throw new Error('Package has no products');
+    }
+
+    let totalVolume = 0;
+    let maxW = 0, maxH = 0, maxD = 0;
+
+    pkg.product_list.forEach(product => {
+      const dims = product.dimensions || { width: 10, length: 10, height: 10 };
+      totalVolume += dims.width * dims.length * dims.height;
+      maxW = Math.max(maxW, dims.width);
+      maxH = Math.max(maxH, dims.height);
+      maxD = Math.max(maxD, dims.length);
+    });
+
+    const cubeRoot = Math.cbrt(totalVolume);
+    return {
+      weight,
+      w: Math.max(maxW, cubeRoot),
+      h: Math.max(maxH, cubeRoot),
+      d: Math.max(maxD, cubeRoot)
+    };
+  }
+
+  // Helper: Update package status
+  private async updatePackageStatus(packageIds: string[], status: PackageStatus) {
+    if (!packageIds.length) return;
+
+    const validIds = packageIds
+      .filter(id => Types.ObjectId.isValid(id))
+      .map(id => new Types.ObjectId(id));
+
+    if (validIds.length) {
+      await this.packageModel.updateMany(
+        { _id: { $in: validIds } },
+        { package_status: status, updatedAt: new Date() }
+      );
+    }
+  }
+
+  // Helper: Complete job
+  private async completeJob(jobId: string, success: boolean) {
+    await this.jobModel.findByIdAndUpdate(jobId, {
+      job_status: success ? JobStatus.COMPLETED : JobStatus.CANCELLED,
+      updatedAt: new Date()
+    });
+  }
+
+  // Helper: Create cart and baskets in database
+  private async createCartAndBaskets(
+    cartId: string,
+    cartType: '1:1' | '1:m',
+    basketSize: any,
+    packages: PackageForProcessing[],
+    basketDetails: any[]
+  ) {
+    const basketRecords: Array<{
+      _id: Types.ObjectId;
+      basket_size: any;
+      basket_type: BasketType;
+      basket_status: BasketStatus;
+      package_count: any;
+    }> = [];
+
+    for (const detail of basketDetails) {
+      // Fix: collect all package_ids from all products in the basket
+      const allPackageIds = Array.isArray(detail.products)
+        ? detail.products.flatMap(prod => prod.package_ids)
+        : [];
+      const basketPackages = packages.filter(p => allPackageIds.includes(p._id));
+      const basketType = cartType === '1:m' ? BasketType.ONE_TO_MANY : BasketType.ONE_TO_ONE;
+
+      const basketRecord = new this.basketModel({
+        basket_size: {
+          _id: new Types.ObjectId(basketSize._id),
+          package_name: basketSize.package_name,
+          package_width: basketSize.package_width,
+          package_length: basketSize.package_length,
+          package_height: basketSize.package_height,
+          package_weight: basketSize.package_weight,
+          package_cost: basketSize.package_cost,
+        },
+        [cartType === '1:m' ? 'single_package' : 'package_list']:
+          cartType === '1:m'
+            ? basketPackages[0] ? {
+                _id: new Types.ObjectId(basketPackages[0]._id),
+                product_list: basketPackages[0].product_list.map(p => ({
+                  _id: new Types.ObjectId(p._id),
+                  product_name: p.product_name
+                })),
+                package_type: basketPackages[0].package_type,
+                package_status: PackageStatus.PACKED,
+              } : null
+            : basketPackages.map(pkg => ({
+                _id: new Types.ObjectId(pkg._id),
+                product_list: pkg.product_list.map(p => ({
+                  _id: new Types.ObjectId(p._id),
+                  product_name: p.product_name
+                })),
+                package_type: pkg.package_type,
+                package_status: PackageStatus.PACKED,
+              })),
+        basket_type: basketType,
+        basket_status: BasketStatus.PENDING,
+      });
+
+      const savedBasket = await basketRecord.save();
+      basketRecords.push({
+        _id: savedBasket._id,
+        basket_size: basketRecord.basket_size,
+        basket_type: basketType,
+        basket_status: BasketStatus.PENDING,
+        package_count: detail.packages_count,
+      });
+    }
+
+    const cartRecord = new this.cartModel({
+      basket_list: basketRecords,
+      cart_status: CartStatus.PENDING,
+      total_baskets: basketRecords.length,
+      total_packages: packages.length,
+      total_products: packages.reduce((sum, pkg) => sum + pkg.product_list.length, 0),
+      total_cost: basketRecords.reduce((sum, b) => sum + b.basket_size.package_cost, 0),
+    });
+
+    const savedCart = await cartRecord.save();
+    return { cartDbId: savedCart._id.toString() };
+  }
+
+  // Helper: Create failed result
+  private createFailedResult(message: string): CartPackingResultNew {
+    return {
+      success: false,
       cart_object_id: '',
       cart_type: '1:1',
       basket_size_used: '',
@@ -163,9 +671,203 @@ export class MainPackingService {
       packages_processed: 0,
       packages_packed: 0,
       packages_unpacked: 0,
-      job_id: '',
+      job_object_id: '',
       cart_details: { baskets: [] },
       message
     };
+  }
+
+  // Get packed packages with location info
+  async getPackedPackagesWithLocation() {
+    const baskets = await this.basketModel.find().sort({ createdAt: 1 }).lean();
+    const carts = await this.cartModel.find().lean();
+
+    const basketToCartMap = new Map();
+    carts.forEach(cart => {
+      cart.basket_list?.forEach(basket => {
+        basketToCartMap.set(basket._id.toString(), cart._id.toString());
+      });
+    });
+
+    type PackedPackageWithLocation = {
+      package_id: string;
+      product_list: {
+        _id: string;
+        product_name: string;
+        product_weight: number;
+        dimensions: { width: number; length: number; height: number };
+      }[];
+      cart_id: string;
+      basket_id: string;
+      createdAt: Date;
+    };
+
+    const result: PackedPackageWithLocation[] = [];
+    for (const basket of baskets) {
+      const cartId = basketToCartMap.get(basket._id.toString());
+      if (!cartId) continue;
+
+      const packages = [
+        ...(Array.isArray(basket.package_list) ? basket.package_list : []),
+        ...(basket.single_package ? [basket.single_package] : [])
+      ];
+
+      for (const packageInfo of packages) {
+        const fullPackage = await this.packageModel
+          .findById(packageInfo._id)
+          .populate('product_list._id', 'product_name product_weight dimensions')
+          .select('product_list package_type package_status createdAt')
+          .lean();
+
+        if (fullPackage) {
+          result.push({
+            package_id: fullPackage._id.toString(),
+            product_list: (fullPackage.product_list || []).map((p: any) => ({
+              _id: p._id?.toString?.() || p._id?.toString() || p._id || 'unknown',
+              product_name: p._id?.product_name || p.product_name || 'Unknown',
+              product_weight: p._id?.product_weight ?? p.product_weight ?? 100,
+              dimensions: p._id?.dimensions ?? p.dimensions ?? { width: 10, length: 10, height: 10 }
+            })),
+            cart_id: cartId,
+            basket_id: basket._id.toString(),
+            createdAt: new Date()
+          });
+        }
+      }
+    }
+
+    return result.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+  }
+
+  // Get packing statistics
+  async getPackingStats() {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const [unpackCount, processingCount, completedJobs, failedJobs] = await Promise.all([
+      this.packageModel.countDocuments({ package_status: PackageStatus.UNPACK }),
+      this.packageModel.countDocuments({ package_status: PackageStatus.IN_PROCESS }),
+      this.jobModel.countDocuments({ job_status: JobStatus.COMPLETED, createdAt: { $gte: today } }),
+      this.jobModel.countDocuments({ job_status: JobStatus.CANCELLED, createdAt: { $gte: today } })
+    ]);
+
+    return {
+      total_unpack_packages: unpackCount,
+      packages_in_processing: processingCount,
+      completed_jobs_today: completedJobs,
+      failed_jobs_today: failedJobs
+    };
+  }
+
+  async findSmallestBasket(input: any): Promise<any> {
+    // Get all basket sizes, sorted smallest first
+    if (!input || typeof input !== 'object' || !Array.isArray(input.products)) {
+      return { success: false, message: 'Invalid input: products array is required' };
+    }
+    const basketSizes = await this.basketSizeModel
+      .find({ package_use: true })
+      .sort({ package_width: 1, package_length: 1, package_height: 1 })
+      .lean();
+
+    if (!basketSizes.length) {
+      return { success: false, message: 'No basket sizes available' };
+    }
+
+    // Prepare product(s) info
+    const products = (input.products || []).map((p: any) => ({
+      product_name: p.name,
+      product_weight: p.weight,
+      dimensions: {
+        width: p.dimension_width,
+        length: p.dimension_length,
+        height: p.dimension_height,
+        depth: p.dimension_length,
+      },
+    }));
+
+    // One product type: try all baskets with 6 rotations
+    if (input.package_type === 'one_product_type' && products.length === 1) {
+      const prod = products[0];
+      for (const basket of basketSizes) {
+        const basketDims = {
+          w: basket.package_width,
+          h: basket.package_height,
+          d: basket.package_length,
+          maxWeight: basket.package_weight * 1000,
+        };
+        const prodWeight = prod.product_weight || 100;
+        if (prodWeight > basketDims.maxWeight) continue;
+
+        const rotations = [
+          [prod.dimensions.width, prod.dimensions.height, prod.dimensions.length],
+          [prod.dimensions.height, prod.dimensions.width, prod.dimensions.length],
+          [prod.dimensions.length, prod.dimensions.height, prod.dimensions.width],
+          [prod.dimensions.width, prod.dimensions.length, prod.dimensions.height],
+          [prod.dimensions.height, prod.dimensions.length, prod.dimensions.width],
+          [prod.dimensions.length, prod.dimensions.width, prod.dimensions.height],
+        ];
+
+        for (const [w, h, d] of rotations) {
+          if (w <= basketDims.w && h <= basketDims.h && d <= basketDims.d) {
+            return {
+              success: true,
+              basket: basket,
+              rotation: { width: w, height: h, length: d },
+              message: `Fits in basket "${basket.package_name}" with rotation`,
+            };
+          }
+        }
+      }
+      return { success: false, message: 'No basket can fit this product' };
+    }
+
+    // Many product type: use singleCalService to try all baskets
+    if (input.package_type === 'many_product_type' && products.length > 0) {
+      for (const basket of basketSizes) {
+        const singleCalPackages = products.map((prod, idx) => ({
+          _id: idx.toString(),
+          package_id: idx.toString(),
+          product_id: idx.toString(),
+          weight: prod.product_weight || 100,
+          w: prod.dimensions.width,
+          h: prod.dimensions.height,
+          d: prod.dimensions.length || prod.dimensions.depth,
+          dimensions: {
+            width: prod.dimensions.width,
+            height: prod.dimensions.height,
+            depth: prod.dimensions.length || prod.dimensions.depth,
+          },
+          quantity: 1,
+          package_type: 'ONE_TO_ONE',
+          package_status: 'UNPACK',
+          cost: 0,
+        }));
+
+        const basketInputs = [{
+          basket_size_id: basket._id.toString(),
+          dimensions: {
+            width: basket.package_width,
+            height: basket.package_height,
+            depth: basket.package_length,
+          },
+          max_weight: basket.package_weight,
+          cost: basket.package_cost || 0,
+        }];
+
+        // Try packing
+        const result = await this.singleCalService.packSingleCal(singleCalPackages, basketInputs);
+        if (result.success && result.cart_details?.baskets?.length === 1) {
+          return {
+            success: true,
+            basket: basket,
+            message: `All products fit in basket "${basket.package_name}"`,
+            details: result.cart_details.baskets[0],
+          };
+        }
+      }
+      return { success: false, message: 'No basket can fit all products in one basket' };
+    }
+
+    return { success: false, message: 'Invalid input or unsupported package_type' };
   }
 }
