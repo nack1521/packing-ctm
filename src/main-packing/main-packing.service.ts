@@ -486,7 +486,7 @@ export class MainPackingService {
 
     // Collect all packed package IDs
     const packedIds = baskets.flatMap(basket =>
-      basket.products.flatMap(prod => prod.package_ids)
+      basket.products.flatMap(prod => prod.package_object_ids || prod.package_ids)
     );
 
     await this.updatePackageStatus(packedIds, PackageStatus.PACKED);
@@ -559,16 +559,18 @@ export class MainPackingService {
   private async updatePackageStatus(packageIds: string[], status: PackageStatus) {
     if (!packageIds.length) return;
 
-    const validIds = packageIds
-      .filter(id => Types.ObjectId.isValid(id))
-      .map(id => new Types.ObjectId(id));
+    const validIds = packageIds.map(id => {
+      try {
+        return Types.ObjectId.isValid(id) ? new Types.ObjectId(id) : id;
+      } catch {
+        return id;
+      }
+    });
 
-    if (validIds.length) {
-      await this.packageModel.updateMany(
-        { _id: { $in: validIds } },
-        { package_status: status, updatedAt: new Date() }
-      );
-    }
+    await this.packageModel.updateMany(
+      { _id: { $in: validIds } },
+      { package_status: status, updatedAt: new Date() }
+    );
   }
 
   // Helper: Complete job
