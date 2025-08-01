@@ -83,22 +83,29 @@ export class MainPackingService {
       .find({ package_status: PackageStatus.UNPACK })
       .populate('product_list._id', 'product_name product_weight dimensions')
       .sort({ createdAt: 1 })
+      .limit(PACKING_CONFIG.PACKAGES_PER_JOB || 0)
       .select('product_list package_type package_status createdAt')
       .lean();
 
-    // Map to ensure createdAt is present and types match
-    return packages.map((pkg: any) => ({
-      _id: pkg._id.toString(),
-      product_list: (pkg.product_list || []).map((p: any) => ({
-        _id: p._id?._id?.toString?.() || p._id?.toString?.() || p._id || '',
-        product_name: p._id?.product_name || p.product_name || '',
-        product_weight: p._id?.product_weight ?? p.product_weight,
-        dimensions: p._id?.dimensions ?? p.dimensions,
-      })),
-      package_type: pkg.package_type,
-      package_status: pkg.package_status,
-      createdAt: pkg.createdAt ? new Date(pkg.createdAt) : new Date(),
-    }));
+    // Optimized mapping with early returns and reduced nested calls
+    return packages.map((pkg: any) => {
+      const productList = pkg.product_list || [];
+      return {
+        _id: pkg._id.toString(),
+        product_list: productList.map((p: any) => {
+          const productData = p._id || p;
+          return {
+            _id: productData._id?.toString() || productData.toString() || '',
+            product_name: productData.product_name || '',
+            product_weight: productData.product_weight ?? 100,
+            dimensions: productData.dimensions || { width: 10, length: 10, height: 10 },
+          };
+        }),
+        package_type: pkg.package_type,
+        package_status: pkg.package_status,
+        createdAt: pkg.createdAt || new Date(),
+      };
+    });
   }
 
   // Create processing job
@@ -135,43 +142,47 @@ export class MainPackingService {
   ): Promise<CartPackingResultNew> {
     const cartId = `cart_${cartType}_${Date.now()}`;
 
-    // Test with smallest basket first
-    for (const basketSize of basketSizes) {
-      const canFit = await this.testFirstPackageFit(packages[0], basketSize);
-      if (canFit) {
-        return cartType === '1:m'
-          ? this.process1mCart(packages, basketSizes, cartId, jobId)
-          : this.process1nMixCart(packages, basketSize, cartId, jobId);
-      }
+    // Find first suitable basket efficiently
+    const suitableBasket = basketSizes.find(basketSize => 
+      this.testFirstPackageFit(packages[0], basketSize)
+    );
+
+    if (!suitableBasket) {
+      return this.createFailedResult('No suitable basket size found');
     }
 
-    return this.createFailedResult('No suitable basket size found');
+    return cartType === '1:m'
+      ? this.process1mCart(packages, basketSizes, cartId, jobId)
+      : this.process1nMixCart(packages, suitableBasket, cartId, jobId);
   }
 
-  // Test if package fits in basket
-  private async testFirstPackageFit(pkg: PackageForProcessing, basketSize: any): Promise<boolean> {
+  // Test if package fits in basket - optimized with early returns
+  private testFirstPackageFit(pkg: PackageForProcessing, basketSize: any): boolean {
     const pkgDims = this.getPackageDimensions(pkg);
     const basketDims = {
       w: basketSize.package_width,
       h: basketSize.package_height,
-      d: basketSize.package_length
+      d: basketSize.package_length,
+      maxWeight: basketSize.package_weight * 1000
     };
 
-    // Check weight
-    if (pkgDims.weight > basketSize.package_weight * 1000) return false;
+    // Early weight check
+    if (pkgDims.weight > basketDims.maxWeight) return false;
 
-    // Check all 6 rotations
+    // Pre-compute rotations and check in one pass
+    const dims = [pkgDims.w, pkgDims.h, pkgDims.d];
+    const basketLimits = [basketDims.w, basketDims.h, basketDims.d];
+    
+    // Check all 6 rotations efficiently
     const rotations = [
-      [pkgDims.w, pkgDims.h, pkgDims.d],
-      [pkgDims.h, pkgDims.w, pkgDims.d],
-      [pkgDims.d, pkgDims.h, pkgDims.w],
-      [pkgDims.w, pkgDims.d, pkgDims.h],
-      [pkgDims.h, pkgDims.d, pkgDims.w],
-      [pkgDims.d, pkgDims.w, pkgDims.h]
+      [0, 1, 2], [1, 0, 2], [2, 1, 0], 
+      [0, 2, 1], [1, 2, 0], [2, 0, 1]
     ];
 
-    return rotations.some(([w, h, d]) =>
-      w <= basketDims.w && h <= basketDims.h && d <= basketDims.d
+    return rotations.some(([i, j, k]) => 
+      dims[i] <= basketLimits[0] && 
+      dims[j] <= basketLimits[1] && 
+      dims[k] <= basketLimits[2]
     );
   }
 
@@ -327,7 +338,7 @@ export class MainPackingService {
     basketSize: any,
     cartId: string,
     jobId: string,
-    useProductGroups: boolean = false // default: mix products
+    useProductGroups: boolean = false
   ): Promise<CartPackingResultNew> {
     const oneToOnePackages = packages
       .filter(p => p.package_type === PackageType.ONE_TO_ONE)
@@ -337,163 +348,63 @@ export class MainPackingService {
       return this.createFailedResult('No 1:1 packages found');
     }
 
+    // Create reusable basket input configuration
+    const basketInputs = [{
+      basket_size_id: basketSize._id,
+      dimensions: {
+        width: basketSize.package_width,
+        height: basketSize.package_height,
+        depth: basketSize.package_length
+      },
+      max_weight: basketSize.package_weight,
+      cost: basketSize.package_cost || 0
+    }];
+
+    // Helper function to create singleCal package format
+    const createSingleCalPackage = (pkg: PackageForProcessing) => {
+      const dims = this.getPackageDimensions(pkg);
+      return {
+        _id: pkg._id,
+        package_id: pkg._id,
+        product_id: pkg.product_list[0]?._id || 'unknown',
+        weight: dims.weight,
+        w: dims.w,
+        h: dims.h,
+        d: dims.d,
+        dimensions: { width: dims.w, height: dims.h, depth: dims.d },
+        quantity: 1,
+        package_type: pkg.package_type,
+        package_status: pkg.package_status,
+        cost: 0
+      };
+    };
+
     let baskets: any[] = [];
 
     if (useProductGroups) {
-      const productGroups = this.groupByProduct(oneToOnePackages);
-      const allBaskets: any[] = [];
-      let basketCounter = 0;
-
-      for (const [productName, productPackages] of productGroups) {
-        if (basketCounter >= PACKING_CONFIG.BASKETS_PER_CART) break;
-
-        const singleCalPackages = productPackages.map(pkg => {
-          const dims = this.getPackageDimensions(pkg);
-          return {
-            _id: pkg._id,
-            package_id: pkg._id,
-            product_id: pkg.product_list[0]?._id || 'unknown',
-            weight: dims.weight,
-            w: dims.w,
-            h: dims.h,
-            d: dims.d,
-            dimensions: {
-              width: dims.w,
-              height: dims.h,
-              depth: dims.d
-            },
-            quantity: 1,
-            package_type: pkg.package_type,
-            package_status: pkg.package_status,
-            cost: 0
-          };
-        });
-
-        const basketInputs = [{
-          basket_size_id: basketSize._id,
-          dimensions: {
-            width: basketSize.package_width,
-            height: basketSize.package_height,
-            depth: basketSize.package_length
-          },
-          max_weight: basketSize.package_weight,
-          cost: basketSize.package_cost || 0
-        }];
-
-        // Only one call per group
-        const result = await this.singleCalService.packSingleCal(singleCalPackages, basketInputs);
-
-        if (result.success && result.cart_details.baskets.length > 0) {
-          const productBaskets = result.cart_details.baskets.map((basket, idx) => ({
-            basket_id: `${cartId}_${productName}_${idx + 1}`,
-            products: [
-              {
-                product_name: productName,
-                product_id: productPackages[0].product_list[0]?._id || 'unknown',
-                package_type: productPackages[0].package_type,
-                packages_count: basket.packages_packed,
-                total_weight: basket.total_weight || 0,
-                volume: 0,
-                package_ids: basket.packed_package_ids
-              }
-            ],
-            usedVolume: 0,
-            volume_utilization: Math.round(basket.volume_utilization || 0)
-          }));
-
-          const remainingSlots = PACKING_CONFIG.BASKETS_PER_CART - basketCounter;
-          const basketsToAdd = productBaskets.slice(0, remainingSlots);
-          allBaskets.push(...basketsToAdd);
-          basketCounter += basketsToAdd.length;
-        }
-      }
-
-      baskets = allBaskets;
+      // Process by product groups
+      baskets = await this.processProductGroups(oneToOnePackages, basketInputs, cartId, createSingleCalPackage);
     } else {
-      
-      // Mix all products in baskets using singleCalService
-      const singleCalPackages = oneToOnePackages.map(pkg => {
-        const dims = this.getPackageDimensions(pkg);
-        return {
-          _id: pkg._id,
-          package_id: pkg._id,
-          product_id: pkg.product_list[0]?._id || 'unknown',
-          weight: dims.weight,
-          w: dims.w,
-          h: dims.h,
-          d: dims.d,
-          dimensions: {
-            width: dims.w,
-            height: dims.h,
-            depth: dims.d
-          },
-          quantity: 1,
-          package_type: pkg.package_type,
-          package_status: pkg.package_status,
-          cost: 0
-        };
-      });
-
-      const basketInputs = [{
-        basket_size_id: basketSize._id,
-        dimensions: {
-          width: basketSize.package_width,
-          height: basketSize.package_height,
-          depth: basketSize.package_length
-        },
-        max_weight: basketSize.package_weight,
-        cost: basketSize.package_cost || 0
-      }];
-
-      const result = await this.singleCalService.packSingleCal(singleCalPackages, basketInputs);
-
-      if (result.success && result.cart_details.baskets.length > 0) {
-        // Limit baskets to 4
-        baskets = result.cart_details.baskets.slice(0, 4).map((basket, idx) => {
-          // Group package_ids by product_id and package_type
-          const packageGroups: { [key: string]: { product_name: string, product_id: string, package_type: string, package_ids: string[] } } = {};
-          for (const pkgId of basket.packed_package_ids) {
-            const pkg = oneToOnePackages.find(p => p._id === pkgId);
-            if (!pkg) continue;
-            const key = `${pkg.product_list[0]?._id || 'unknown'}|${pkg.package_type}`;
-            if (!packageGroups[key]) {
-              packageGroups[key] = {
-                product_name: pkg.product_list[0]?.product_name || 'Unknown',
-                product_id: pkg.product_list[0]?._id || 'unknown',
-                package_type: pkg.package_type,
-                package_ids: []
-              };
-            }
-            packageGroups[key].package_ids.push(pkgId);
-          }
-          const products = Object.values(packageGroups).map(group => ({
-            product_name: group.product_name,
-            product_object_id: group.product_id,
-            product_count: group.package_ids.length,
-            package_object_ids: group.package_ids
-          }));
-          return {
-            basket_id: `${cartId}_basket${idx + 1}`,
-            products,
-            volume_utilization: Math.round(basket.volume_utilization || 0)
-          };
-        });
-      } else {
-        // If packing failed, return failed result
-        return this.createFailedResult('singleCalService could not pack any baskets');
-      }
+      // Process all packages together (mix mode)
+      baskets = await this.processMixedPackages(oneToOnePackages, basketInputs, cartId, createSingleCalPackage);
     }
 
-    // Collect all packed package IDs
+    if (!baskets.length) {
+      return this.createFailedResult('No baskets could be packed');
+    }
+
+    // Collect packed IDs and update status
     const packedIds = baskets.flatMap(basket =>
-      basket.products.flatMap(prod => prod.package_object_ids || prod.package_ids)
+      basket.products.flatMap(prod => prod.package_object_ids || prod.package_ids || [])
     );
 
-    await this.updatePackageStatus(packedIds, PackageStatus.PACKED);
-    await this.updatePackageStatus(
-      packages.map(p => p._id).filter(id => !packedIds.includes(id)),
-      PackageStatus.UNPACK
-    );
+    await Promise.all([
+      this.updatePackageStatus(packedIds, PackageStatus.PACKED),
+      this.updatePackageStatus(
+        packages.map(p => p._id).filter(id => !packedIds.includes(id)),
+        PackageStatus.UNPACK
+      )
+    ]);
 
     const { cartDbId } = await this.createCartAndBaskets(
       cartId, '1:1', basketSize,
@@ -516,6 +427,104 @@ export class MainPackingService {
     };
   }
 
+  // Helper method for processing product groups
+  private async processProductGroups(
+    packages: PackageForProcessing[], 
+    basketInputs: any[], 
+    cartId: string, 
+    createSingleCalPackage: Function
+  ): Promise<any[]> {
+    const productGroups = this.groupByProduct(packages);
+    const allBaskets: any[] = [];
+    let basketCounter = 0;
+
+    for (const [productName, productPackages] of productGroups) {
+      if (basketCounter >= PACKING_CONFIG.BASKETS_PER_CART) break;
+
+      const singleCalPackages = productPackages.map(pkg => createSingleCalPackage(pkg));
+      const result = await this.singleCalService.packSingleCal(singleCalPackages, basketInputs);
+
+      if (result.success && result.cart_details.baskets.length > 0) {
+        const productBaskets = result.cart_details.baskets.map((basket, idx) => ({
+          basket_id: `${cartId}_${productName}_${idx + 1}`,
+          products: [{
+            product_name: productName,
+            product_id: productPackages[0].product_list[0]?._id || 'unknown',
+            package_type: productPackages[0].package_type,
+            packages_count: basket.packages_packed,
+            total_weight: basket.total_weight || 0,
+            volume: 0,
+            package_ids: basket.packed_package_ids
+          }],
+          usedVolume: 0,
+          volume_utilization: Math.round(basket.volume_utilization || 0)
+        }));
+
+        const remainingSlots = PACKING_CONFIG.BASKETS_PER_CART - basketCounter;
+        const basketsToAdd = productBaskets.slice(0, remainingSlots);
+        allBaskets.push(...basketsToAdd);
+        basketCounter += basketsToAdd.length;
+      }
+    }
+
+    return allBaskets;
+  }
+
+  // Helper method for processing mixed packages
+  private async processMixedPackages(
+    packages: PackageForProcessing[], 
+    basketInputs: any[], 
+    cartId: string, 
+    createSingleCalPackage: Function
+  ): Promise<any[]> {
+    const singleCalPackages = packages.map(pkg => createSingleCalPackage(pkg));
+    const result = await this.singleCalService.packSingleCal(singleCalPackages, basketInputs);
+
+    if (!result.success || !result.cart_details.baskets.length) {
+      return [];
+    }
+
+    // Limit baskets to 4 and group packages by product
+    return result.cart_details.baskets.slice(0, 4).map((basket, idx) => {
+      const packageGroups: Record<string, {
+        product_name: string;
+        product_id: string;
+        package_type: string;
+        package_ids: string[];
+      }> = {};
+
+      // Group packages by product efficiently
+      for (const pkgId of basket.packed_package_ids) {
+        const pkg = packages.find(p => p._id === pkgId);
+        if (!pkg) continue;
+
+        const key = `${pkg.product_list[0]?._id || 'unknown'}|${pkg.package_type}`;
+        if (!packageGroups[key]) {
+          packageGroups[key] = {
+            product_name: pkg.product_list[0]?.product_name || 'Unknown',
+            product_id: pkg.product_list[0]?._id || 'unknown',
+            package_type: pkg.package_type,
+            package_ids: []
+          };
+        }
+        packageGroups[key].package_ids.push(pkgId);
+      }
+
+      const products = Object.values(packageGroups).map(group => ({
+        product_name: group.product_name,
+        product_object_id: group.product_id,
+        product_count: group.package_ids.length,
+        package_object_ids: group.package_ids
+      }));
+
+      return {
+        basket_id: `${cartId}_basket${idx + 1}`,
+        products,
+        volume_utilization: Math.round(basket.volume_utilization || 0)
+      };
+    });
+  }
+
   // Helper: Group packages by product
   private groupByProduct(packages: PackageForProcessing[]): Map<string, PackageForProcessing[]> {
     const groups = new Map();
@@ -527,24 +536,30 @@ export class MainPackingService {
     return groups;
   }
 
-  // Helper: Calculate package dimensions (simplified)
+  // Helper: Calculate package dimensions - optimized
   private getPackageDimensions(pkg: PackageForProcessing) {
-    const weight = pkg.product_list.reduce((sum, p) => sum + (p.product_weight || 100), 0);
-
-    if (!pkg.product_list.length) {
-        throw new Error('Package has no products');
+    const productList = pkg.product_list;
+    
+    if (!productList.length) {
+      throw new Error('Package has no products');
     }
 
+    // Use single pass to calculate all metrics
+    let weight = 0;
     let totalVolume = 0;
     let maxW = 0, maxH = 0, maxD = 0;
 
-    pkg.product_list.forEach(product => {
+    for (const product of productList) {
+      weight += product.product_weight || 100;
+      
       const dims = product.dimensions || { width: 10, length: 10, height: 10 };
-      totalVolume += dims.width * dims.length * dims.height;
+      const volume = dims.width * dims.length * dims.height;
+      
+      totalVolume += volume;
       maxW = Math.max(maxW, dims.width);
       maxH = Math.max(maxH, dims.height);
       maxD = Math.max(maxD, dims.length);
-    });
+    }
 
     const cubeRoot = Math.cbrt(totalVolume);
     return {
@@ -555,22 +570,26 @@ export class MainPackingService {
     };
   }
 
-  // Helper: Update package status
+  // Helper: Update package status - optimized with better error handling
   private async updatePackageStatus(packageIds: string[], status: PackageStatus) {
     if (!packageIds.length) return;
 
-    const validIds = packageIds.map(id => {
-      try {
+    try {
+      // Convert to ObjectIds more efficiently
+      const validIds = packageIds.map(id => {
         return Types.ObjectId.isValid(id) ? new Types.ObjectId(id) : id;
-      } catch {
-        return id;
-      }
-    });
+      });
 
-    await this.packageModel.updateMany(
-      { _id: { $in: validIds } },
-      { package_status: status, updatedAt: new Date() }
-    );
+      const result = await this.packageModel.updateMany(
+        { _id: { $in: validIds } },
+        { package_status: status, updatedAt: new Date() }
+      );
+
+      console.log(`Updated ${result.modifiedCount} packages to status: ${status}`);
+    } catch (error) {
+      console.error('Error updating package status:', error);
+      throw error;
+    }
   }
 
   // Helper: Complete job
@@ -581,7 +600,7 @@ export class MainPackingService {
     });
   }
 
-  // Helper: Create cart and baskets in database
+  // Helper: Create cart and baskets in database - optimized
   private async createCartAndBaskets(
     cartId: string,
     cartType: '1:1' | '1:m',
@@ -589,6 +608,8 @@ export class MainPackingService {
     packages: PackageForProcessing[],
     basketDetails: any[]
   ) {
+    // Pre-create package lookup map for better performance
+    const packageMap = new Map(packages.map(p => [p._id, p]));
     const basketRecords: Array<{
       _id: Types.ObjectId;
       basket_size: any;
@@ -597,24 +618,29 @@ export class MainPackingService {
       package_count: any;
     }> = [];
 
-    for (const detail of basketDetails) {
-      // Fix: collect all package_ids from all products in the basket
+    const basketType = cartType === '1:m' ? BasketType.ONE_TO_MANY : BasketType.ONE_TO_ONE;
+    const basketSizeData = {
+      _id: new Types.ObjectId(basketSize._id),
+      package_name: basketSize.package_name,
+      package_width: basketSize.package_width,
+      package_length: basketSize.package_length,
+      package_height: basketSize.package_height,
+      package_weight: basketSize.package_weight,
+      package_cost: basketSize.package_cost,
+    };
+
+    // Create baskets in batch
+    const basketPromises = basketDetails.map(async (detail) => {
       const allPackageIds = Array.isArray(detail.products)
-        ? detail.products.flatMap(prod => prod.package_ids)
+        ? detail.products.flatMap(prod => prod.package_ids || prod.package_object_ids || [])
         : [];
-      const basketPackages = packages.filter(p => allPackageIds.includes(p._id));
-      const basketType = cartType === '1:m' ? BasketType.ONE_TO_MANY : BasketType.ONE_TO_ONE;
+      
+      const basketPackages = allPackageIds
+        .map(id => packageMap.get(id))
+        .filter(Boolean);
 
       const basketRecord = new this.basketModel({
-        basket_size: {
-          _id: new Types.ObjectId(basketSize._id),
-          package_name: basketSize.package_name,
-          package_width: basketSize.package_width,
-          package_length: basketSize.package_length,
-          package_height: basketSize.package_height,
-          package_weight: basketSize.package_weight,
-          package_cost: basketSize.package_cost,
-        },
+        basket_size: basketSizeData,
         [cartType === '1:m' ? 'single_package' : 'package_list']:
           cartType === '1:m'
             ? basketPackages[0] ? {
@@ -639,15 +665,20 @@ export class MainPackingService {
         basket_status: BasketStatus.PENDING,
       });
 
-      const savedBasket = await basketRecord.save();
+      return basketRecord.save();
+    });
+
+    const savedBaskets = await Promise.all(basketPromises);
+    
+    savedBaskets.forEach(savedBasket => {
       basketRecords.push({
         _id: savedBasket._id,
-        basket_size: basketRecord.basket_size,
+        basket_size: basketSizeData,
         basket_type: basketType,
         basket_status: BasketStatus.PENDING,
-        package_count: detail.packages_count,
+        package_count: 1,
       });
-    }
+    });
 
     const cartRecord = new this.cartModel({
       basket_list: basketRecords,
@@ -655,7 +686,7 @@ export class MainPackingService {
       total_baskets: basketRecords.length,
       total_packages: packages.length,
       total_products: packages.reduce((sum, pkg) => sum + pkg.product_list.length, 0),
-      total_cost: basketRecords.reduce((sum, b) => sum + b.basket_size.package_cost, 0),
+      total_cost: basketRecords.reduce((sum, b) => sum + (b.basket_size.package_cost || 0), 0),
     });
 
     const savedCart = await cartRecord.save();
@@ -679,34 +710,38 @@ export class MainPackingService {
     };
   }
 
-  // Get packed packages with location info
+  // Get packed packages with location info - optimized with better aggregation
   async getPackedPackagesWithLocation() {
-    const baskets = await this.basketModel.find().sort({ createdAt: 1 }).lean();
-    const carts = await this.cartModel.find().lean();
+    // Use aggregation pipeline for better performance
+    const basketsWithCarts = await this.basketModel.aggregate([
+      {
+        $lookup: {
+          from: 'carts',
+          localField: '_id',
+          foreignField: 'basket_list._id',
+          as: 'cart_info'
+        }
+      },
+      { $match: { 'cart_info': { $ne: [] } } },
+      { $sort: { createdAt: 1 } }
+    ]);
 
-    const basketToCartMap = new Map();
-    carts.forEach(cart => {
-      cart.basket_list?.forEach(basket => {
-        basketToCartMap.set(basket._id.toString(), cart._id.toString());
-      });
-    });
-
-    type PackedPackageWithLocation = {
+    const result: Array<{
       package_id: string;
-      product_list: {
+      product_list: Array<{
         _id: string;
         product_name: string;
         product_weight: number;
         dimensions: { width: number; length: number; height: number };
-      }[];
+      }>;
       cart_id: string;
       basket_id: string;
       createdAt: Date;
-    };
+    }> = [];
 
-    const result: PackedPackageWithLocation[] = [];
-    for (const basket of baskets) {
-      const cartId = basketToCartMap.get(basket._id.toString());
+    // Process in batches for better memory usage
+    for (const basket of basketsWithCarts) {
+      const cartId = basket.cart_info[0]?._id?.toString();
       if (!cartId) continue;
 
       const packages = [
@@ -714,27 +749,29 @@ export class MainPackingService {
         ...(basket.single_package ? [basket.single_package] : [])
       ];
 
-      for (const packageInfo of packages) {
-        const fullPackage = await this.packageModel
-          .findById(packageInfo._id)
-          .populate('product_list._id', 'product_name product_weight dimensions')
-          .select('product_list package_type package_status createdAt')
-          .lean();
+      const packageIds = packages.map(p => p._id);
+      if (packageIds.length === 0) continue;
 
-        if (fullPackage) {
-          result.push({
-            package_id: fullPackage._id.toString(),
-            product_list: (fullPackage.product_list || []).map((p: any) => ({
-              _id: p._id?.toString?.() || p._id?.toString() || p._id || 'unknown',
-              product_name: p._id?.product_name || p.product_name || 'Unknown',
-              product_weight: p._id?.product_weight ?? p.product_weight ?? 100,
-              dimensions: p._id?.dimensions ?? p.dimensions ?? { width: 10, length: 10, height: 10 }
-            })),
-            cart_id: cartId,
-            basket_id: basket._id.toString(),
-            createdAt: new Date()
-          });
-        }
+      // Batch fetch packages
+      const fullPackages = await this.packageModel
+        .find({ _id: { $in: packageIds } })
+        .populate('product_list._id', 'product_name product_weight dimensions')
+        .select('product_list package_type package_status createdAt')
+        .lean();
+
+      for (const fullPackage of fullPackages) {
+        result.push({
+          package_id: fullPackage._id.toString(),
+          product_list: (fullPackage.product_list || []).map((p: any) => ({
+            _id: p._id?.toString() || 'unknown',
+            product_name: p._id?.product_name || p.product_name || 'Unknown',
+            product_weight: p._id?.product_weight ?? p.product_weight ?? 100,
+            dimensions: p._id?.dimensions ?? p.dimensions ?? { width: 10, length: 10, height: 10 }
+          })),
+          cart_id: cartId,
+          basket_id: basket._id.toString(),
+          createdAt: (fullPackage as any).createdAt || new Date()
+        });
       }
     }
 

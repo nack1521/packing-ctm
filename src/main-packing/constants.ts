@@ -7,7 +7,8 @@ export const PACKING_CONFIG = {
   BASKETS_PER_CART: 4,
   TARGET_UTILIZATION_PERCENTAGE: 60, // Target 85% volume utilization per basket
   MAX_UTILIZATION_PERCENTAGE: 75,   // Maximum 95% before basket is considered full
-  ESTIMATED_MINUTES_PER_PACKAGE: 10 // Estimate 10 minutes per package for job duration
+  ESTIMATED_MINUTES_PER_PACKAGE: 10, // Estimate 10 minutes per package for job duration
+  PACKAGES_PER_JOB: 0
 } as const;
 
 // Default Dimensions (in cm)
