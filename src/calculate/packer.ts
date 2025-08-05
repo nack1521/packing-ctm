@@ -218,17 +218,17 @@ export class Packer {
     }
 
     const packingStrategies: PackingStrategy[] = [
-      {
-        name: 'Primary Strategy',
-        params: {
-          bigger_first: true,
-          distribute_items: false,
-          fix_point: true,
-          check_stable: true,
-          support_surface_ratio: 0.75,
-          number_of_decimals: 0
-        }
-      },
+      // {
+      //   name: 'Primary Strategy',
+      //   params: {
+      //     bigger_first: true,
+      //     distribute_items: false,
+      //     fix_point: true,
+      //     check_stable: true,
+      //     support_surface_ratio: 0.75,
+      //     number_of_decimals: 0
+      //   }
+      // },
       {
         name: 'Relaxed Stability',
         params: {
@@ -240,17 +240,17 @@ export class Packer {
           number_of_decimals: 0
         }
       },
-      {
-        name: 'Minimal Stability',
-        params: {
-          bigger_first: true,
-          distribute_items: false,
-          fix_point: true,
-          check_stable: true,
-          support_surface_ratio: 0.3,
-          number_of_decimals: 0
-        }
-      },
+      // {
+      //   name: 'Minimal Stability',
+      //   params: {
+      //     bigger_first: true,
+      //     distribute_items: false,
+      //     fix_point: true,
+      //     check_stable: true,
+      //     support_surface_ratio: 0.3,
+      //     number_of_decimals: 0
+      //   }
+      // },
       // {
       //   name: 'Basic Packing',
       //   params: {

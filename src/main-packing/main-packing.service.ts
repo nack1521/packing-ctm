@@ -466,7 +466,7 @@ export class MainPackingService {
     };
   }
 
-  // Helper method for processing product groups
+  // Helper method for processing product groups - Refactored using process1mCart pattern
   private async processProductGroups(
     packages: PackageForProcessing[], 
     basketInputs: any[], 
@@ -474,44 +474,84 @@ export class MainPackingService {
     createSingleCalPackage: Function
   ): Promise<any[]> {
     const productGroups = this.groupByProduct(packages);
-    const allBaskets: any[] = [];
-    let basketCounter = 0;
     
-    // Get the basket size from basketInputs
+    // Get basket size info for max baskets (should be 1 for F basket)
     const basketSize = await this.basketSizeModel.findById(basketInputs[0].basket_size_id).lean();
-    const maxBasketsForThisSize = basketSize ? this.getMaxBasketsForSize(basketSize) : PACKING_CONFIG.BASKETS_PER_CART;
+    const maxBasketsForThisSize = basketSize ? this.getMaxBasketsForSize(basketSize) : 1;
+    
+    console.log(`🎯 Processing ${productGroups.size} product groups with max ${maxBasketsForThisSize} basket(s), target: ${PACKING_CONFIG.MAX_UTILIZATION_PERCENTAGE}%`);
 
-    for (const [productName, productPackages] of productGroups) {
-      if (basketCounter >= maxBasketsForThisSize) break;
+    // Convert all packages to singleCal format at once
+    const allSingleCalPackages = Array.from(productGroups.values()).flat().map(pkg => createSingleCalPackage(pkg));
+    
+    // Try to pack all packages in one go
+    const result = await this.singleCalService.packSingleCal(allSingleCalPackages, basketInputs);
 
-      const singleCalPackages = productPackages.map(pkg => createSingleCalPackage(pkg));
-      const result = await this.singleCalService.packSingleCal(singleCalPackages, basketInputs);
-
-      if (result.success && result.cart_details.baskets.length > 0) {
-        const productBaskets = result.cart_details.baskets.map((basket, idx) => ({
-          basket_id: `${cartId}_${productName}_${idx + 1}`,
-          products: [{
-            product_name: productName,
-            product_id: productPackages[0].product_list[0]?._id || 'unknown',
-            package_type: productPackages[0].package_type,
-            packages_count: basket.packages_packed,
-            total_weight: basket.total_weight || 0,
-            volume: 0,
-            package_ids: basket.packed_package_ids
-          }],
-          usedVolume: 0,
-          volume_utilization: Math.round(basket.volume_utilization || 0)
-        }));
-
-        const remainingSlots = maxBasketsForThisSize - basketCounter;
-        const basketsToAdd = productBaskets.slice(0, remainingSlots);
-        allBaskets.push(...basketsToAdd);
-        basketCounter += basketsToAdd.length;
-      }
+    if (!result.success || !result.cart_details?.baskets?.length) {
+      console.log('❌ Failed to pack any packages');
+      return [];
     }
 
-    return allBaskets;
+    // Get the first basket (since we're limiting to 1 basket for F size)
+    const basket = result.cart_details.baskets[0];
+    const utilization = basket.volume_utilization || 0;
+    
+    console.log(`📊 Packed all packages: ${utilization}% utilization`);
+
+    // Check if utilization is within acceptable range
+    if (utilization > PACKING_CONFIG.MAX_UTILIZATION_PERCENTAGE) {
+      console.log(`⚠️ Utilization ${utilization}% exceeds max ${PACKING_CONFIG.MAX_UTILIZATION_PERCENTAGE}%, trying to optimize...`);
+      
+      // If over limit, try with reduced packages (optional optimization)
+      //return await this.optimizePackingWithinLimit(packages, basketInputs, cartId, createSingleCalPackage);
+    }
+
+    // Get packed packages
+    const packedPackageIds = basket.packed_package_ids || [];
+    const packedPackages = packages.filter(pkg => packedPackageIds.includes(pkg._id));
+    
+    if (!packedPackages.length) {
+      console.log('❌ No packages were successfully packed');
+      return [];
+    }
+
+    // Group packed packages by product for the basket structure
+    const productSummary: any[] = [];
+    const groupedByProduct = new Map<string, PackageForProcessing[]>();
+    
+    packedPackages.forEach(pkg => {
+      const productName = pkg.product_list[0]?.product_name || 'Unknown';
+      if (!groupedByProduct.has(productName)) {
+        groupedByProduct.set(productName, []);
+      }
+      groupedByProduct.get(productName)!.push(pkg);
+    });
+
+    // Build product summary
+    for (const [productName, productPkgs] of groupedByProduct) {
+      productSummary.push({
+        product_name: productName,
+        product_id: productPkgs[0].product_list[0]?._id || 'unknown',
+        package_type: productPkgs[0].package_type,
+        packages_count: productPkgs.length,
+        total_weight: productPkgs.reduce((sum, pkg) => {
+          const dims = this.getPackageDimensions(pkg);
+          return sum + dims.weight;
+        }, 0),
+        volume: 0,
+        package_ids: productPkgs.map(pkg => pkg._id)
+      });
+    }
+
+    const finalBasket = {
+      basket_id: `${cartId}_mixed_basket_1`,
+      products: productSummary,
+      volume_utilization: Math.round(utilization),
+    };
+    
+    return [finalBasket];
   }
+
 
   // Helper method for processing mixed packages
   private async processMixedPackages(
