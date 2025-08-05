@@ -7,7 +7,7 @@ import { BasketSize } from '../basket_sizes/schemas/basket_size.schema';
 import { Cart, CartStatus } from '../carts/schemas/cart.schema';
 import { Basket, BasketType, BasketStatus } from '../baskets/schemas/basket.schema';
 import { SingleCalService } from '../single_cal/single_cal.service';
-import { PACKING_CONFIG } from './constants';
+import { PACKING_CONFIG, BASKET_SIZE_CONFIG } from './constants';
 
 interface ProductInfo {
   _id: string;
@@ -48,6 +48,30 @@ export class MainPackingService {
     @InjectModel(Basket.name) private basketModel: Model<Basket>,
     private singleCalService: SingleCalService
   ) {}
+
+  /**
+   * Helper function to get maximum baskets allowed per cart for a specific basket size
+   */
+  private getMaxBasketsForSize(basketSize: any): number {
+    // First try to get limit by short name
+    const shortName = basketSize.package_short_name?.toUpperCase();
+    if (shortName && BASKET_SIZE_CONFIG.MAX_BASKETS_PER_SIZE[shortName]) {
+      return BASKET_SIZE_CONFIG.MAX_BASKETS_PER_SIZE[shortName];
+    }
+
+    // Fallback to volume-based calculation
+    const volume = basketSize.package_width * basketSize.package_length * basketSize.package_height;
+    
+    for (const config of BASKET_SIZE_CONFIG.VOLUME_BASED_LIMITS) {
+      if (volume <= config.maxVolume) {
+        return config.maxBaskets;
+      }
+    }
+
+    // Default fallback
+    return PACKING_CONFIG.BASKETS_PER_CART;
+  }
+
 
   async processMixPackingWorkflow(): Promise<CartPackingResultNew> {
     try {
@@ -200,7 +224,7 @@ export class MainPackingService {
       return this.createFailedResult('No 1:m packages found');
     }
 
-    // Find the smallest basket that can fit the first package using singleCalService
+    // Find the smallest basket that can fit the first package
     let referenceBasket: any = null;
     for (const basketSize of basketSizes) {
       const singleCalPackages = oneToManyPackages.length
@@ -247,13 +271,16 @@ export class MainPackingService {
       return this.createFailedResult('No suitable basket found for the first package');
     }
 
+    // Get max baskets for this specific size
+    const maxBasketsForSize = this.getMaxBasketsForSize(referenceBasket);
+
     // Now try to pack each ONE_TO_MANY package into a basket of referenceBasket size
     const baskets: any[] = [];
     let basketCounter = 1;
     const packedIds: string[] = [];
 
     for (const pkg of oneToManyPackages) {
-      if (baskets.length >= 4) break;
+      if (baskets.length >= maxBasketsForSize) break;
 
       // Prepare singleCal input for this package
       const singleCalPackages = pkg.product_list.map((product, idx) => ({
@@ -298,7 +325,7 @@ export class MainPackingService {
             product_count: 1,
             package_ids: [pkg._id]
           })),
-          volume_utilization: Math.round(result.cart_details.baskets[0].volume_utilization || 0)
+          volume_utilization: Math.round(result.cart_details.baskets[0].volume_utilization || 0),
         });
         packedIds.push(pkg._id);
       }
@@ -329,7 +356,7 @@ export class MainPackingService {
       packages_unpacked: oneToManyPackages.length - packedIds.length,
       job_object_id: jobId,
       cart_details: { baskets },
-      message: `1:m cart: ${packedIds.length} packages in ${baskets.length} baskets (max 4)`
+      message: `1:m cart: ${packedIds.length} packages in ${baskets.length} baskets (max ${maxBasketsForSize} for size ${referenceBasket.package_short_name})`
     };
   }
 
@@ -338,7 +365,7 @@ export class MainPackingService {
     basketSize: any,
     cartId: string,
     jobId: string,
-    useProductGroups: boolean = false
+    useProductGroups: boolean = true
   ): Promise<CartPackingResultNew> {
     const oneToOnePackages = packages
       .filter(p => p.package_type === PackageType.ONE_TO_ONE)
@@ -348,16 +375,28 @@ export class MainPackingService {
       return this.createFailedResult('No 1:1 packages found');
     }
 
-    // Create reusable basket input configuration
+    // Force use only basket size "F" - get F basket from database
+    const fBasket = await this.basketSizeModel.findOne({ 
+      package_short_name: 'F',
+      package_use: true 
+    }).lean();
+
+    if (!fBasket) {
+      return this.createFailedResult('Basket size "F" not found or not available');
+    }
+
+    console.log(`Forcing use of basket size F: ${fBasket.package_name}`);
+
+    // Create reusable basket input configuration for F basket only
     const basketInputs = [{
-      basket_size_id: basketSize._id,
+      basket_size_id: fBasket._id,
       dimensions: {
-        width: basketSize.package_width,
-        height: basketSize.package_height,
-        depth: basketSize.package_length
+        width: fBasket.package_width,
+        height: fBasket.package_height,
+        depth: fBasket.package_length
       },
-      max_weight: basketSize.package_weight,
-      cost: basketSize.package_cost || 0
+      max_weight: fBasket.package_weight,
+      cost: fBasket.package_cost || 0
     }];
 
     // Helper function to create singleCal package format
@@ -382,15 +421,15 @@ export class MainPackingService {
     let baskets: any[] = [];
 
     if (useProductGroups) {
-      // Process by product groups
+      // Process by product groups using F basket only
       baskets = await this.processProductGroups(oneToOnePackages, basketInputs, cartId, createSingleCalPackage);
     } else {
-      // Process all packages together (mix mode)
+      // Process all packages together (mix mode) using F basket only
       baskets = await this.processMixedPackages(oneToOnePackages, basketInputs, cartId, createSingleCalPackage);
     }
 
     if (!baskets.length) {
-      return this.createFailedResult('No baskets could be packed');
+      return this.createFailedResult('No baskets could be packed with basket size F');
     }
 
     // Collect packed IDs and update status
@@ -407,7 +446,7 @@ export class MainPackingService {
     ]);
 
     const { cartDbId } = await this.createCartAndBaskets(
-      cartId, '1:1', basketSize,
+      cartId, '1:1', fBasket, // Use F basket instead of original basketSize
       oneToOnePackages.filter(p => packedIds.includes(p._id)),
       baskets
     );
@@ -416,14 +455,14 @@ export class MainPackingService {
       success: true,
       cart_object_id: cartDbId,
       cart_type: '1:1',
-      basket_size_used: basketSize.package_name,
+      basket_size_used: fBasket.package_name, // Use F basket name
       total_baskets: baskets.length,
       packages_processed: packages.length,
       packages_packed: packedIds.length,
       packages_unpacked: packages.length - packedIds.length,
       job_object_id: jobId,
       cart_details: { baskets },
-      message: `1:1 mixed cart: ${packedIds.length} packages in ${baskets.length} baskets`
+      message: `1:1 mixed cart with F basket only: ${packedIds.length} packages in ${baskets.length} baskets`
     };
   }
 
@@ -437,9 +476,13 @@ export class MainPackingService {
     const productGroups = this.groupByProduct(packages);
     const allBaskets: any[] = [];
     let basketCounter = 0;
+    
+    // Get the basket size from basketInputs
+    const basketSize = await this.basketSizeModel.findById(basketInputs[0].basket_size_id).lean();
+    const maxBasketsForThisSize = basketSize ? this.getMaxBasketsForSize(basketSize) : PACKING_CONFIG.BASKETS_PER_CART;
 
     for (const [productName, productPackages] of productGroups) {
-      if (basketCounter >= PACKING_CONFIG.BASKETS_PER_CART) break;
+      if (basketCounter >= maxBasketsForThisSize) break;
 
       const singleCalPackages = productPackages.map(pkg => createSingleCalPackage(pkg));
       const result = await this.singleCalService.packSingleCal(singleCalPackages, basketInputs);
@@ -460,7 +503,7 @@ export class MainPackingService {
           volume_utilization: Math.round(basket.volume_utilization || 0)
         }));
 
-        const remainingSlots = PACKING_CONFIG.BASKETS_PER_CART - basketCounter;
+        const remainingSlots = maxBasketsForThisSize - basketCounter;
         const basketsToAdd = productBaskets.slice(0, remainingSlots);
         allBaskets.push(...basketsToAdd);
         basketCounter += basketsToAdd.length;
@@ -484,8 +527,12 @@ export class MainPackingService {
       return [];
     }
 
-    // Limit baskets to 4 and group packages by product
-    return result.cart_details.baskets.slice(0, 4).map((basket, idx) => {
+    // Get the basket size to determine max baskets
+    const basketSize = await this.basketSizeModel.findById(basketInputs[0].basket_size_id).lean();
+    const maxBasketsForThisSize = basketSize ? this.getMaxBasketsForSize(basketSize) : PACKING_CONFIG.BASKETS_PER_CART;
+
+    // Limit baskets based on size-specific configuration and group packages by product
+    return result.cart_details.baskets.slice(0, maxBasketsForThisSize).map((basket, idx) => {
       const packageGroups: Record<string, {
         product_name: string;
         product_id: string;
@@ -520,7 +567,7 @@ export class MainPackingService {
       return {
         basket_id: `${cartId}_basket${idx + 1}`,
         products,
-        volume_utilization: Math.round(basket.volume_utilization || 0)
+        volume_utilization: Math.round(basket.volume_utilization || 0),
       };
     });
   }

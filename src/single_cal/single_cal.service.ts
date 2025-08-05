@@ -5,6 +5,8 @@ import { CalculateService, PackageInput, BasketInput } from '../calculate/calcul
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { Package } from '../packages/schemas/package.schema';
+import { BasketSize } from '../basket_sizes/schemas/basket_size.schema';
+import { BASKET_SIZE_CONFIG, PACKING_CONFIG } from '../main-packing/constants';
 
 export interface SingleCalPackageInput extends PackageInput {
   _id: string;
@@ -37,8 +39,42 @@ export interface SingleCalResult {
 export class SingleCalService {
   constructor(
     private readonly calculateService: CalculateService,
-    @InjectModel(Package.name) private packageModel: Model<Package>
+    @InjectModel(Package.name) private packageModel: Model<Package>,
+    @InjectModel(BasketSize.name) private basketSizeModel: Model<BasketSize>
   ) {}
+
+  /**
+   * Helper function to get maximum baskets allowed per cart for a specific basket size
+   */
+  private async getMaxBasketsForSize(basketSizeId: string): Promise<number> {
+    try {
+      const basketSize = await this.basketSizeModel.findById(basketSizeId).lean();
+      if (!basketSize) {
+        return PACKING_CONFIG.BASKETS_PER_CART;
+      }
+
+      // First try to get limit by short name
+      const shortName = basketSize.package_short_name?.toUpperCase();
+      if (shortName && BASKET_SIZE_CONFIG.MAX_BASKETS_PER_SIZE[shortName]) {
+        return BASKET_SIZE_CONFIG.MAX_BASKETS_PER_SIZE[shortName];
+      }
+
+      // Fallback to volume-based calculation
+      const volume = basketSize.package_width * basketSize.package_length * basketSize.package_height;
+      
+      for (const config of BASKET_SIZE_CONFIG.VOLUME_BASED_LIMITS) {
+        if (volume <= config.maxVolume) {
+          return config.maxBaskets;
+        }
+      }
+
+      // Default fallback
+      return PACKING_CONFIG.BASKETS_PER_CART;
+    } catch (error) {
+      console.error('Error getting basket size info:', error);
+      return PACKING_CONFIG.BASKETS_PER_CART;
+    }
+  }
 
   /**
    * Pack packages into baskets - single_cal logic
@@ -47,7 +83,7 @@ export class SingleCalService {
    * - No re-packing - failed packages get status "unpack"
    * - Stop when 1 cart is successfully packed
    */
-  async packSingleCal(packages: SingleCalPackageInput[], basketOptions: BasketInput[]): Promise<SingleCalResult> {
+  async  packSingleCal(packages: SingleCalPackageInput[], basketOptions: BasketInput[]): Promise<SingleCalResult> {
     console.log(`Starting single_cal packing for ${packages.length} packages...`);
     
     if (!packages || packages.length === 0) {
@@ -127,6 +163,10 @@ export class SingleCalService {
     const remainingPackages = [...packages];
     let basketIndex = 1;
 
+    // Get dynamic max baskets limit based on basket size
+    const maxBaskets = await this.getMaxBasketsForSize(basketOption.basket_size_id);
+    console.log(`  Using max ${maxBaskets} baskets for basket size: ${basketOption.basket_size_id}`);
+
     // Keep creating baskets until all packages are packed or no more can fit
     while (remainingPackages.length > 0) {
       const basketId = `${basketOption.basket_size_id}_${basketIndex}`;
@@ -135,7 +175,7 @@ export class SingleCalService {
       const packingResult = await this.calculateService.calculatePacking(remainingPackages, basketOption);
 
       if (packingResult.fitted_items === 0) {
-        // No packages could fit in this basket - stop trying
+        console.log(`  ! No packages could fit in basket ${basketIndex}`);
         break;
       }
 
@@ -163,24 +203,26 @@ export class SingleCalService {
         basket_id: basketId,
         packages_allocated: packedInThisBasket.length,
         packages_packed: packingResult.fitted_items,
-        packing_success_rate: 100, // Since we only count successfully fitted packages
+        packing_success_rate: 100,
         total_weight: packingResult.total_weight,
         volume_utilization: packingResult.basket_utilization,
         packed_package_ids: packedInThisBasket
       });
 
+      console.log(`  ✓ Basket ${basketIndex}: packed ${packedInThisBasket.length} packages (${packingResult.basket_utilization}% utilization)`);
+
       basketIndex++;
 
-      // Stop after reasonable number of baskets to prevent infinite loop
-      if (basketIndex > 4) {
-        console.log(`  ! Stopped after 4 baskets to prevent infinite loop`);
+      // Stop after reaching max baskets limit for this size
+      if (basketIndex > maxBaskets) {
+        console.log(`  ! Stopped after ${maxBaskets} baskets (max limit for this basket size)`);
         break;
       }
     }
 
     const totalPacked = allPackedIds.length;
     const unpackedIds = packages.filter(p => !allPackedIds.includes(p._id)).map(p => p._id);
-    const cartPacked = totalPacked > 0; // Cart is considered packed if at least some packages were packed
+    const cartPacked = totalPacked > 0;
 
     return {
       success: cartPacked,
@@ -194,7 +236,7 @@ export class SingleCalService {
         baskets: baskets
       },
       message: cartPacked 
-        ? `Successfully packed ${totalPacked}/${packages.length} packages in ${baskets.length} baskets`
+        ? `Successfully packed ${totalPacked}/${packages.length} packages in ${baskets.length}/${maxBaskets} baskets`
         : 'No packages could be packed'
     };
   }

@@ -11,6 +11,26 @@ export const PACKING_CONFIG = {
   PACKAGES_PER_JOB: 0
 } as const;
 
+// Basket Size Configuration - Different max baskets per cart for each size
+export const BASKET_SIZE_CONFIG = {
+  // Map basket size short names to maximum baskets allowed per cart
+  MAX_BASKETS_PER_SIZE: {
+    'A': 64,  // Small baskets - allow more per cart
+    'B': 48,  // Medium baskets - standard amount
+    'C': 24,  // Large baskets - fewer per cart
+    'D': 9,
+    'F': 1    // Extra large baskets - minimum per cart
+  },
+  
+  // Fallback configuration based on volume ranges (in cubic cm)
+  VOLUME_BASED_LIMITS: [
+    { maxVolume: Infinity, maxBaskets: 64 },    // Very small baskets
+    { maxVolume: Infinity, maxBaskets: 48 },   // Small-medium baskets
+    { maxVolume: Infinity, maxBaskets: 24 },   // Large baskets
+    { maxVolume: Infinity, maxBaskets: 9 } // Extra large baskets
+  ]
+} as const;
+
 // Default Dimensions (in cm)
 export const DEFAULT_DIMENSIONS = {
   PACKAGE: { width: 10, height: 10, depth: 10 },

@@ -251,17 +251,17 @@ export class Packer {
           number_of_decimals: 0
         }
       },
-      {
-        name: 'Basic Packing',
-        params: {
-          bigger_first: true,
-          distribute_items: false,
-          fix_point: false,
-          check_stable: false,
-          support_surface_ratio: 0.0,
-          number_of_decimals: 0
-        }
-      }
+      // {
+      //   name: 'Basic Packing',
+      //   params: {
+      //     bigger_first: true,
+      //     distribute_items: false,
+      //     fix_point: false,
+      //     check_stable: false,
+      //     support_surface_ratio: 0.0,
+      //     number_of_decimals: 0
+      //   }
+      // }
     ];
 
     let bestResult: PackingResult | null = null;
