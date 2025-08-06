@@ -27,7 +27,8 @@ export const BASKET_SIZE_CONFIG = {
     { maxVolume: Infinity, maxBaskets: 64 },    // Very small baskets
     { maxVolume: Infinity, maxBaskets: 48 },   // Small-medium baskets
     { maxVolume: Infinity, maxBaskets: 24 },   // Large baskets
-    { maxVolume: Infinity, maxBaskets: 9 } // Extra large baskets
+    { maxVolume: Infinity, maxBaskets: 9 },    // Extra large baskets
+    { maxVolume: Infinity, maxBaskets: 1 }     // Free size baskets
   ]
 } as const;
 
